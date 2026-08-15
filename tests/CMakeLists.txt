@@ -221,3 +221,16 @@ target_link_libraries(
     mpt-crypto
     secp256k1::secp256k1
 )
+
+# Full aggregated Bulletproof Hybrid-v1 end-to-end benchmark.
+# Build manually; do not register with CTest.
+add_executable(
+  benchmark_bulletproof_agg_hybrid_v1
+  benchmark_bulletproof_agg_hybrid_v1.c
+)
+target_link_libraries(
+  benchmark_bulletproof_agg_hybrid_v1
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)
