@@ -3941,20 +3941,38 @@ int ipa_verify_hybrid_v1_fast(
 
   binary_base_n = cur_n;
 
-  /*
-   * Degenerate case: no binary suffix.  The fast verifier intentionally
-   * dispatches to the already preferred explicit Hybrid-v1 verifier rather
-   * than duplicating the direct terminal check.
-   */
   if (r2 == 0)
-  {
-    ok = ipa_verify_explicit_hybrid_v1(
-        ctx, G_vec, H_vec, U, P_in, n, k3,
-        L1_3w_vec, L2_3w_vec, R1_3w_vec, R2_3w_vec,
-        L_2w_vec, R_2w_vec,
-        a_terminal, b_terminal, ux, ipa_transcript_id);
+{
+    if (cur_n != terminal_n)
+        goto cleanup;
+
+    if (!msm_add_checked_3w(
+            ctx, &RHS, &RHS_inited,
+            Gw, a_terminal, terminal_n))
+        goto cleanup;
+
+    if (!msm_add_checked_3w(
+            ctx, &RHS, &RHS_inited,
+            Hw, b_terminal, terminal_n))
+        goto cleanup;
+
+    if (!secp256k1_bulletproof_ipa_dot(
+            ctx, dot,
+            a_terminal, b_terminal,
+            terminal_n))
+        goto cleanup;
+
+    if (!add_scaled_U_term_3w(
+            ctx, &RHS, &RHS_inited,
+            U, dot, ux))
+        goto cleanup;
+
+    if (!RHS_inited)
+        goto cleanup;
+
+    ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
     goto cleanup;
-  }
+}
 
   x_flat =
       (unsigned char *)malloc(r2 * kMPT_SCALAR_SIZE);
