@@ -200,3 +200,9 @@ add_mpt_test(
     test_ipa_hybrid_v1.c
     DEPENDENCIES mpt-crypto secp256k1::secp256k1
 )
+
+add_mpt_test(
+    test_ipa_hybrid_v1_fast
+    test_ipa_hybrid_v1_fast.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)

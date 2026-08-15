@@ -3735,6 +3735,453 @@ cleanup:
   return ok;
 }
 
+/* ==========================================================================
+ * Hybrid IPA v1 optimized verifier.
+ *
+ * Verification strategy:
+ *
+ *   3W prefix : explicit generator folding (the faster 3W strategy on the
+ *               current backend).
+ *
+ *   2W suffix : coefficient reconstruction + MSM, generalized to terminal
+ *               dimension t in {1,2,3}.
+ *
+ * This verifies exactly the same Hybrid-v1 proof as
+ * ipa_verify_explicit_hybrid_v1().  No proof bytes, padding rules, schedule,
+ * transcript domains, or terminal relation are changed.
+ * ========================================================================== */
+
+static void hybrid_v1_2w_leaf_coefficients_and_slot(
+    unsigned char g_coeff[kMPT_SCALAR_SIZE],
+    unsigned char h_coeff[kMPT_SCALAR_SIZE],
+    size_t *terminal_slot_out,
+    size_t start_index,
+    size_t start_round,
+    const size_t *dims,
+    const unsigned char *x_flat,
+    const unsigned char *xinv_flat,
+    size_t rounds)
+{
+  size_t pos = start_index;
+
+  memset(g_coeff, 0, kMPT_SCALAR_SIZE);
+  memset(h_coeff, 0, kMPT_SCALAR_SIZE);
+  g_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+  h_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+
+  for (size_t r = start_round; r < rounds; ++r)
+  {
+    const size_t half_n = (dims[r] + 1) / 2;
+    const unsigned char *x =
+        x_flat + r * kMPT_SCALAR_SIZE;
+    const unsigned char *x_inv =
+        xinv_flat + r * kMPT_SCALAR_SIZE;
+
+    if (pos < half_n)
+    {
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x_inv);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x);
+    }
+    else
+    {
+      pos -= half_n;
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x_inv);
+    }
+  }
+
+  *terminal_slot_out = pos;
+}
+
+/*
+ * Optimized Hybrid-v1 verifier.
+ *
+ * The 3W prefix is folded explicitly into Gw/Hw/P.  Once the schedule switches
+ * to 2W, Gw/Hw are treated as the logical leaves of the binary suffix.
+ * Binary challenges are derived normally and P is updated normally, but the
+ * generators are not folded round-by-round.  Instead each binary leaf obtains
+ * its final coefficient and terminal slot, and the terminal a_j/b_j scalar is
+ * multiplied into that coefficient before the final G/H MSMs.
+ */
+int ipa_verify_hybrid_v1_fast(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    size_t n,
+    size_t k3,
+    const secp256k1_pubkey *L1_3w_vec,
+    const secp256k1_pubkey *L2_3w_vec,
+    const secp256k1_pubkey *R1_3w_vec,
+    const secp256k1_pubkey *R2_3w_vec,
+    const secp256k1_pubkey *L_2w_vec,
+    const secp256k1_pubkey *R_2w_vec,
+    const unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  const size_t capacity = n + 2;
+
+  size_t r3 = 0, r2 = 0, terminal_n = 0;
+  size_t cur_n = n;
+  size_t global_round = 0;
+
+  secp256k1_pubkey *Gw = NULL;
+  secp256k1_pubkey *Hw = NULL;
+
+  unsigned char *x_flat = NULL;
+  unsigned char *xinv_flat = NULL;
+  size_t *dims = NULL;
+
+  secp256k1_pubkey *G_points = NULL;
+  secp256k1_pubkey *H_points = NULL;
+  unsigned char *G_scalars = NULL;
+  unsigned char *H_scalars = NULL;
+
+  secp256k1_pubkey P, RHS;
+
+  unsigned char x3[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x3_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  unsigned char dot[kMPT_SCALAR_SIZE] = {0};
+
+  size_t binary_base_n = 0;
+  size_t binary_pad_count = 0;
+  size_t total_points = 0;
+
+  int RHS_inited = 0;
+  int ok = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_terminal || !b_terminal || !ux ||
+      !ipa_transcript_id || n == 0)
+    return 0;
+
+  if (!secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+          n, k3, &r3, &r2, &terminal_n))
+    return 0;
+
+  if (r3 > 0 &&
+      (!L1_3w_vec || !L2_3w_vec || !R1_3w_vec || !R2_3w_vec))
+    return 0;
+
+  if (r2 > 0 && (!L_2w_vec || !R_2w_vec))
+    return 0;
+
+  for (size_t i = 0; i < terminal_n; ++i)
+  {
+    if (!scalar_is_canonical_3w(
+            a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_canonical_3w(
+            b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  for (size_t i = terminal_n; i < 3; ++i)
+  {
+    if (!scalar_is_zero(a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_zero(b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Gw));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Hw));
+  if (!Gw || !Hw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(*Gw));
+  memcpy(Hw, H_vec, n * sizeof(*Hw));
+  P = *P_in;
+
+  if (!derive_ipa_hybrid_v1_seed(last, ipa_transcript_id, n, k3))
+    goto cleanup;
+
+  /* ---------- Preferred 3W implementation: explicit prefix ---------- */
+  for (size_t r = 0; r < r3; ++r, ++global_round)
+  {
+    const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+    const size_t pad = padded_n - cur_n;
+    const size_t third_n = padded_n / 3;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x3, last,
+            &L1_3w_vec[r], &L2_3w_vec[r],
+            &R1_3w_vec[r], &R2_3w_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x3_inv, x3) ||
+        secp256k1_ec_seckey_verify(ctx, x3_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_3w(
+            ctx, &P,
+            &L1_3w_vec[r], &L2_3w_vec[r],
+            &R1_3w_vec[r], &R2_3w_vec[r],
+            x3, x3_inv))
+      goto cleanup;
+
+    if (pad &&
+        !derive_ipa_pad_generators_hybrid_v1(
+            ctx, Gw + cur_n, Hw + cur_n, pad,
+            n, k3, global_round, 3))
+      goto cleanup;
+
+    if (!fold_generators_step_3w(
+            ctx, Gw, Hw, third_n, x3, x3_inv))
+      goto cleanup;
+
+    memcpy(last, x3, kMPT_SCALAR_SIZE);
+    cur_n = third_n;
+  }
+
+  binary_base_n = cur_n;
+
+  /*
+   * Degenerate case: no binary suffix.  The fast verifier intentionally
+   * dispatches to the already preferred explicit Hybrid-v1 verifier rather
+   * than duplicating the direct terminal check.
+   */
+  if (r2 == 0)
+  {
+    ok = ipa_verify_explicit_hybrid_v1(
+        ctx, G_vec, H_vec, U, P_in, n, k3,
+        L1_3w_vec, L2_3w_vec, R1_3w_vec, R2_3w_vec,
+        L_2w_vec, R_2w_vec,
+        a_terminal, b_terminal, ux, ipa_transcript_id);
+    goto cleanup;
+  }
+
+  x_flat =
+      (unsigned char *)malloc(r2 * kMPT_SCALAR_SIZE);
+  xinv_flat =
+      (unsigned char *)malloc(r2 * kMPT_SCALAR_SIZE);
+  dims = (size_t *)malloc(r2 * sizeof(*dims));
+
+  if (!x_flat || !xinv_flat || !dims)
+    goto cleanup;
+
+  /*
+   * Derive all binary challenges, update P, and record dimensions.
+   * Gw/Hw are deliberately NOT folded here.
+   */
+  {
+    size_t d = binary_base_n;
+
+    for (size_t r = 0; r < r2; ++r)
+    {
+      const size_t padded_n = bp_ipa_padded_len_2w(d);
+      const size_t half_n = padded_n / 2;
+      unsigned char *xr =
+          x_flat + r * kMPT_SCALAR_SIZE;
+      unsigned char *xri =
+          xinv_flat + r * kMPT_SCALAR_SIZE;
+
+      dims[r] = d;
+
+      if (padded_n != d)
+        ++binary_pad_count;
+
+      if (!derive_ipa_round_challenge(
+              ctx, xr, last, &L_2w_vec[r], &R_2w_vec[r]))
+        goto cleanup;
+
+      if (!secp256k1_mpt_scalar_inverse(xri, xr) ||
+          secp256k1_ec_seckey_verify(ctx, xri) != 1)
+        goto cleanup;
+
+      if (!apply_ipa_folding_to_P_2w_one(
+              ctx, &P, &L_2w_vec[r], &R_2w_vec[r],
+              xr, xri))
+        goto cleanup;
+
+      memcpy(last, xr, kMPT_SCALAR_SIZE);
+      d = half_n;
+      ++global_round;
+    }
+
+    if (d != terminal_n)
+      goto cleanup;
+  }
+
+  total_points = binary_base_n + binary_pad_count;
+
+  G_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(*G_points));
+  H_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(*H_points));
+  G_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+  H_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+
+  if (!G_points || !H_points || !G_scalars || !H_scalars)
+    goto cleanup;
+
+  /*
+   * The explicitly folded 3W prefix generators are the original logical
+   * leaves of the binary suffix.
+   */
+  for (size_t i = 0; i < binary_base_n; ++i)
+  {
+    unsigned char g_fold[kMPT_SCALAR_SIZE];
+    unsigned char h_fold[kMPT_SCALAR_SIZE];
+    size_t slot = 0;
+
+    G_points[i] = Gw[i];
+    H_points[i] = Hw[i];
+
+    hybrid_v1_2w_leaf_coefficients_and_slot(
+        g_fold, h_fold, &slot,
+        i, 0, dims, x_flat, xinv_flat, r2);
+
+    if (slot >= terminal_n)
+    {
+      OPENSSL_cleanse(g_fold, sizeof(g_fold));
+      OPENSSL_cleanse(h_fold, sizeof(h_fold));
+      goto cleanup;
+    }
+
+    secp256k1_mpt_scalar_mul(
+        G_scalars + i * kMPT_SCALAR_SIZE,
+        g_fold,
+        a_terminal + slot * kMPT_SCALAR_SIZE);
+
+    secp256k1_mpt_scalar_mul(
+        H_scalars + i * kMPT_SCALAR_SIZE,
+        h_fold,
+        b_terminal + slot * kMPT_SCALAR_SIZE);
+
+    OPENSSL_cleanse(g_fold, sizeof(g_fold));
+    OPENSSL_cleanse(h_fold, sizeof(h_fold));
+  }
+
+  /*
+   * Add each Hybrid-v1 binary pad leaf exactly once.  A pad born at suffix
+   * round r begins participating at that round.  Its global round number is
+   * k3 + r because the 3W prefix occupies rounds [0, k3).
+   */
+  {
+    size_t out = binary_base_n;
+
+    for (size_t r = 0; r < r2; ++r)
+    {
+      const size_t d = dims[r];
+      const size_t padded_n = bp_ipa_padded_len_2w(d);
+
+      if (padded_n == d)
+        continue;
+
+      if (!derive_ipa_pad_generators_hybrid_v1(
+              ctx, &G_points[out], &H_points[out], 1,
+              n, k3, k3 + r, 2))
+        goto cleanup;
+
+      {
+        unsigned char g_fold[kMPT_SCALAR_SIZE];
+        unsigned char h_fold[kMPT_SCALAR_SIZE];
+        size_t slot = 0;
+
+        hybrid_v1_2w_leaf_coefficients_and_slot(
+            g_fold, h_fold, &slot,
+            d, r, dims, x_flat, xinv_flat, r2);
+
+        if (slot >= terminal_n)
+        {
+          OPENSSL_cleanse(g_fold, sizeof(g_fold));
+          OPENSSL_cleanse(h_fold, sizeof(h_fold));
+          goto cleanup;
+        }
+
+        secp256k1_mpt_scalar_mul(
+            G_scalars + out * kMPT_SCALAR_SIZE,
+            g_fold,
+            a_terminal + slot * kMPT_SCALAR_SIZE);
+
+        secp256k1_mpt_scalar_mul(
+            H_scalars + out * kMPT_SCALAR_SIZE,
+            h_fold,
+            b_terminal + slot * kMPT_SCALAR_SIZE);
+
+        OPENSSL_cleanse(g_fold, sizeof(g_fold));
+        OPENSSL_cleanse(h_fold, sizeof(h_fold));
+      }
+
+      ++out;
+    }
+
+    if (out != total_points)
+      goto cleanup;
+  }
+
+  /*
+   * One G-side and one H-side coefficient/MSM evaluation.
+   */
+  if (!msm_try_add(
+          ctx, &RHS, &RHS_inited,
+          G_points, G_scalars, total_points))
+    goto cleanup;
+
+  if (!msm_try_add(
+          ctx, &RHS, &RHS_inited,
+          H_points, H_scalars, total_points))
+    goto cleanup;
+
+  if (!secp256k1_bulletproof_ipa_dot(
+          ctx, dot, a_terminal, b_terminal, terminal_n))
+    goto cleanup;
+
+  if (!add_scaled_U_term_3w(
+          ctx, &RHS, &RHS_inited, U, dot, ux))
+    goto cleanup;
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(x3, sizeof(x3));
+  OPENSSL_cleanse(x3_inv, sizeof(x3_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+  OPENSSL_cleanse(dot, sizeof(dot));
+
+  if (x_flat)
+    OPENSSL_cleanse(x_flat, r2 * kMPT_SCALAR_SIZE);
+  if (xinv_flat)
+    OPENSSL_cleanse(xinv_flat, r2 * kMPT_SCALAR_SIZE);
+  if (dims)
+    OPENSSL_cleanse(dims, r2 * sizeof(*dims));
+  if (G_scalars)
+    OPENSSL_cleanse(G_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (H_scalars)
+    OPENSSL_cleanse(H_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(*Gw));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(*Hw));
+  if (G_points)
+    OPENSSL_cleanse(G_points, total_points * sizeof(*G_points));
+  if (H_points)
+    OPENSSL_cleanse(H_points, total_points * sizeof(*H_points));
+
+  free(Gw);
+  free(Hw);
+  free(x_flat);
+  free(xinv_flat);
+  free(dims);
+  free(G_points);
+  free(H_points);
+  free(G_scalars);
+  free(H_scalars);
+
+  return ok;
+}
+
 /**
  * Runs the Inner Product Argument (IPA) prover.
  * Recursively folds vectors G, H, a, and b into a single final term,
