@@ -3086,6 +3086,655 @@ cleanup:
   return ok;
 }
 
+/* ==========================================================================
+ * Hybrid IPA v1: fixed 3W prefix, dynamic 2W suffix, generic ET at t <= 3.
+ *
+ * Experimental IPA-only construction.
+ *
+ * Schedule parameter:
+ *   k3 = exact number of initial 3-way rounds.
+ *
+ * The schedule is canonical for (n,k3):
+ *
+ *   - reject k3 if it exceeds the number of 3W rounds needed to reach <= 3;
+ *   - execute exactly k3 local/dynamic 3W rounds;
+ *   - then execute local/dynamic 2W rounds while the dimension is > 3;
+ *   - reveal terminal a/b vectors of length t in {1,2,3}.
+ *
+ * The same Fiat-Shamir chain continues across the 3W -> 2W transition.
+ * A Hybrid-v1 seed binds the base IPA transcript, original n, and k3.
+ * The existing 3W and 2W round-challenge functions use distinct domains, so
+ * the arity of every round is also domain-separated.
+ *
+ * Padding generators use Hybrid-v1-specific domains and bind:
+ *   original n || k3 || global round index || arity || G/H role.
+ *
+ * Proof payload (not counting how k3 is communicated by a future outer format):
+ *
+ *   132 * r3 + 66 * r2 + 64 * terminal_n bytes.
+ * ========================================================================== */
+
+static void hybrid_v1_store_u64_be(unsigned char out[8], uint64_t x)
+{
+  for (int i = 7; i >= 0; --i)
+  {
+    out[i] = (unsigned char)(x & 0xffu);
+    x >>= 8;
+  }
+}
+
+/*
+ * Return the unique Hybrid-v1 schedule for (n,k3).
+ *
+ * k3 is deliberately restricted to an actual 3W-prefix length.  This avoids
+ * multiple encodings such as k3=5 and k3=100 describing the same schedule
+ * after the vector has already reached terminal dimension.
+ */
+int secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+    size_t n,
+    size_t k3,
+    size_t *r3_out,
+    size_t *r2_out,
+    size_t *terminal_n_out)
+{
+  size_t max_k3 = 0;
+  size_t cur_n;
+  size_t r2 = 0;
+
+  if (n == 0)
+    return 0;
+
+  cur_n = n;
+  while (cur_n > 3)
+  {
+    cur_n = (cur_n + 2) / 3;
+    ++max_k3;
+  }
+
+  if (k3 > max_k3)
+    return 0;
+
+  cur_n = n;
+  for (size_t r = 0; r < k3; ++r)
+    cur_n = (cur_n + 2) / 3;
+
+  while (cur_n > 3)
+  {
+    cur_n = (cur_n + 1) / 2;
+    ++r2;
+  }
+
+  if (cur_n == 0 || cur_n > 3)
+    return 0;
+
+  if (r3_out)
+    *r3_out = k3;
+  if (r2_out)
+    *r2_out = r2;
+  if (terminal_n_out)
+    *terminal_n_out = cur_n;
+
+  return 1;
+}
+
+/*
+ * Derive a Hybrid-v1 transcript seed:
+ *
+ *   H("MPT_BP_IPA_HYBRID_V1" || base_transcript || n || k3).
+ *
+ * The seed itself is transcript state, not an EC scalar, so no scalar
+ * reduction is required here.
+ */
+static int derive_ipa_hybrid_v1_seed(
+    unsigned char out[kMPT_SCALAR_SIZE],
+    const unsigned char base_transcript[kMPT_SCALAR_SIZE],
+    size_t n,
+    size_t k3)
+{
+  static const unsigned char domain[] = "MPT_BP_IPA_HYBRID_V1";
+  unsigned char n_be[8], k3_be[8];
+  unsigned char hash[kMPT_HALF_SHA_SIZE];
+  EVP_MD_CTX *mdctx = NULL;
+  int ok = 0;
+
+  if (!out || !base_transcript)
+    return 0;
+
+  hybrid_v1_store_u64_be(n_be, (uint64_t)n);
+  hybrid_v1_store_u64_be(k3_be, (uint64_t)k3);
+
+  mdctx = EVP_MD_CTX_new();
+  if (!mdctx)
+    goto cleanup;
+
+  if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1 ||
+      EVP_DigestUpdate(mdctx, domain, sizeof(domain) - 1) != 1 ||
+      EVP_DigestUpdate(
+          mdctx, base_transcript, kMPT_SCALAR_SIZE) != 1 ||
+      EVP_DigestUpdate(mdctx, n_be, sizeof(n_be)) != 1 ||
+      EVP_DigestUpdate(mdctx, k3_be, sizeof(k3_be)) != 1 ||
+      EVP_DigestFinal_ex(mdctx, hash, NULL) != 1)
+    goto cleanup;
+
+  memcpy(out, hash, kMPT_SCALAR_SIZE);
+  ok = 1;
+
+cleanup:
+  OPENSSL_cleanse(n_be, sizeof(n_be));
+  OPENSSL_cleanse(k3_be, sizeof(k3_be));
+  OPENSSL_cleanse(hash, sizeof(hash));
+  EVP_MD_CTX_free(mdctx);
+  return ok;
+}
+
+/*
+ * Hybrid-specific padding generators.
+ *
+ * arity must be 2 or 3.
+ * pad_count must be 1 for 2W and 1..2 for 3W.
+ *
+ * Labels are fixed 48-byte buffers:
+ *   [tag || zero fill || original_n || k3 || global_round].
+ */
+static int derive_ipa_pad_generators_hybrid_v1(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *G_pad,
+    secp256k1_pubkey *H_pad,
+    size_t pad_count,
+    size_t original_n,
+    size_t k3,
+    size_t global_round,
+    int arity)
+{
+  static const unsigned char tag_2g[] = "IPA_HYB1_2W_PAD_G";
+  static const unsigned char tag_2h[] = "IPA_HYB1_2W_PAD_H";
+  static const unsigned char tag_3g[] = "IPA_HYB1_3W_PAD_G";
+  static const unsigned char tag_3h[] = "IPA_HYB1_3W_PAD_H";
+
+  const unsigned char *tag_g = NULL;
+  const unsigned char *tag_h = NULL;
+  size_t tag_g_len = 0, tag_h_len = 0;
+
+  unsigned char label_g[48] = {0};
+  unsigned char label_h[48] = {0};
+
+  if (!ctx || !G_pad || !H_pad || pad_count == 0)
+    return 0;
+
+  if (arity == 2)
+  {
+    if (pad_count != 1)
+      return 0;
+    tag_g = tag_2g;
+    tag_h = tag_2h;
+    tag_g_len = sizeof(tag_2g) - 1;
+    tag_h_len = sizeof(tag_2h) - 1;
+  }
+  else if (arity == 3)
+  {
+    if (pad_count > 2)
+      return 0;
+    tag_g = tag_3g;
+    tag_h = tag_3h;
+    tag_g_len = sizeof(tag_3g) - 1;
+    tag_h_len = sizeof(tag_3h) - 1;
+  }
+  else
+  {
+    return 0;
+  }
+
+  if (tag_g_len > 24 || tag_h_len > 24)
+    return 0;
+
+  memcpy(label_g, tag_g, tag_g_len);
+  memcpy(label_h, tag_h, tag_h_len);
+
+  hybrid_v1_store_u64_be(label_g + 24, (uint64_t)original_n);
+  hybrid_v1_store_u64_be(label_h + 24, (uint64_t)original_n);
+  hybrid_v1_store_u64_be(label_g + 32, (uint64_t)k3);
+  hybrid_v1_store_u64_be(label_h + 32, (uint64_t)k3);
+  hybrid_v1_store_u64_be(label_g + 40, (uint64_t)global_round);
+  hybrid_v1_store_u64_be(label_h + 40, (uint64_t)global_round);
+
+  if (!secp256k1_mpt_get_generator_vector(
+          ctx, G_pad, pad_count, label_g, sizeof(label_g)))
+    return 0;
+
+  if (!secp256k1_mpt_get_generator_vector(
+          ctx, H_pad, pad_count, label_h, sizeof(label_h)))
+    return 0;
+
+  OPENSSL_cleanse(label_g, sizeof(label_g));
+  OPENSSL_cleanse(label_h, sizeof(label_h));
+  return 1;
+}
+
+/*
+ * Reference prover for Hybrid v1.
+ *
+ * 3W proof points and 2W proof points are kept in separate arrays because
+ * this is an experimental schedule benchmark, not yet a serialized proof
+ * format.
+ */
+int secp256k1_bulletproof_run_ipa_prover_hybrid_v1(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const unsigned char *a_vec,
+    const unsigned char *b_vec,
+    size_t n,
+    size_t k3,
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE],
+    const unsigned char ux_scalar[kMPT_SCALAR_SIZE],
+    secp256k1_pubkey *L1_3w_out,
+    secp256k1_pubkey *L2_3w_out,
+    secp256k1_pubkey *R1_3w_out,
+    secp256k1_pubkey *R2_3w_out,
+    size_t max_3w_rounds,
+    size_t *r3_out,
+    secp256k1_pubkey *L_2w_out,
+    secp256k1_pubkey *R_2w_out,
+    size_t max_2w_rounds,
+    size_t *r2_out,
+    unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    size_t *terminal_n_out)
+{
+  const size_t capacity = n + 2;
+  size_t r3 = 0, r2 = 0, terminal_n = 0;
+  size_t cur_n = n;
+  size_t global_round = 0;
+
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  unsigned char *aw = NULL, *bw = NULL;
+
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+
+  int ok = 0;
+
+  if (!ctx || !U || !G_vec || !H_vec || !a_vec || !b_vec ||
+      !ipa_transcript_id || !ux_scalar ||
+      !a_terminal || !b_terminal || n == 0)
+    return 0;
+
+  if (!secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+          n, k3, &r3, &r2, &terminal_n))
+    return 0;
+
+  if (r3 > max_3w_rounds || r2 > max_2w_rounds)
+    return 0;
+
+  if (r3 > 0 &&
+      (!L1_3w_out || !L2_3w_out || !R1_3w_out || !R2_3w_out))
+    return 0;
+
+  if (r2 > 0 && (!L_2w_out || !R_2w_out))
+    return 0;
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Gw));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Hw));
+  aw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+  bw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+
+  if (!Gw || !Hw || !aw || !bw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(*Gw));
+  memcpy(Hw, H_vec, n * sizeof(*Hw));
+  memcpy(aw, a_vec, n * kMPT_SCALAR_SIZE);
+  memcpy(bw, b_vec, n * kMPT_SCALAR_SIZE);
+
+  if (!derive_ipa_hybrid_v1_seed(last, ipa_transcript_id, n, k3))
+    goto cleanup;
+
+  /* ---------- fixed 3W prefix ---------- */
+  for (size_t r = 0; r < r3; ++r, ++global_round)
+  {
+    const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+    const size_t pad = padded_n - cur_n;
+    const size_t third_n = padded_n / 3;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (pad)
+    {
+      memset(
+          aw + cur_n * kMPT_SCALAR_SIZE, 0,
+          pad * kMPT_SCALAR_SIZE);
+      memset(
+          bw + cur_n * kMPT_SCALAR_SIZE, 0,
+          pad * kMPT_SCALAR_SIZE);
+
+      if (!derive_ipa_pad_generators_hybrid_v1(
+              ctx, Gw + cur_n, Hw + cur_n, pad,
+              n, k3, global_round, 3))
+        goto cleanup;
+    }
+
+    if (!secp256k1_bulletproof_ipa_compute_LR_3w(
+            ctx,
+            &L1_3w_out[r], &L2_3w_out[r],
+            &R1_3w_out[r], &R2_3w_out[r],
+            aw, bw, Gw, Hw, U, ux_scalar, third_n))
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x, last,
+            &L1_3w_out[r], &L2_3w_out[r],
+            &R1_3w_out[r], &R2_3w_out[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!secp256k1_bulletproof_ipa_compress_step_3w(
+            ctx, aw, bw, Gw, Hw, third_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = third_n;
+  }
+
+  /* ---------- dynamic 2W suffix ---------- */
+  for (size_t r = 0; r < r2; ++r, ++global_round)
+  {
+    const size_t padded_n = bp_ipa_padded_len_2w(cur_n);
+    const size_t half_n = padded_n / 2;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (padded_n != cur_n)
+    {
+      memset(
+          aw + cur_n * kMPT_SCALAR_SIZE, 0,
+          kMPT_SCALAR_SIZE);
+      memset(
+          bw + cur_n * kMPT_SCALAR_SIZE, 0,
+          kMPT_SCALAR_SIZE);
+
+      if (!derive_ipa_pad_generators_hybrid_v1(
+              ctx, &Gw[cur_n], &Hw[cur_n], 1,
+              n, k3, global_round, 2))
+        goto cleanup;
+    }
+
+    if (!secp256k1_bulletproof_ipa_compute_LR(
+            ctx, &L_2w_out[r], &R_2w_out[r],
+            aw, aw + half_n * kMPT_SCALAR_SIZE,
+            bw, bw + half_n * kMPT_SCALAR_SIZE,
+            Gw, Gw + half_n,
+            Hw, Hw + half_n,
+            U, ux_scalar, half_n))
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge(
+            ctx, x, last, &L_2w_out[r], &R_2w_out[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!secp256k1_bulletproof_ipa_compress_step(
+            ctx, aw, bw, Gw, Hw, half_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = half_n;
+  }
+
+  if (cur_n != terminal_n || cur_n == 0 || cur_n > 3)
+    goto cleanup;
+
+  memset(a_terminal, 0, 3 * kMPT_SCALAR_SIZE);
+  memset(b_terminal, 0, 3 * kMPT_SCALAR_SIZE);
+  memcpy(a_terminal, aw, cur_n * kMPT_SCALAR_SIZE);
+  memcpy(b_terminal, bw, cur_n * kMPT_SCALAR_SIZE);
+
+  if (r3_out)
+    *r3_out = r3;
+  if (r2_out)
+    *r2_out = r2;
+  if (terminal_n_out)
+    *terminal_n_out = terminal_n;
+
+  ok = 1;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+
+  if (aw)
+    OPENSSL_cleanse(aw, capacity * kMPT_SCALAR_SIZE);
+  if (bw)
+    OPENSSL_cleanse(bw, capacity * kMPT_SCALAR_SIZE);
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(*Gw));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(*Hw));
+
+  free(aw);
+  free(bw);
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
+/*
+ * Reference explicit verifier for Hybrid v1.
+ *
+ * Deliberately folds G/H physically in both phases.  This is the correctness
+ * baseline.  The later performance verifier should keep the 3W prefix explicit
+ * and replace only the binary suffix with coefficient/MSM reconstruction.
+ */
+int ipa_verify_explicit_hybrid_v1(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    size_t n,
+    size_t k3,
+    const secp256k1_pubkey *L1_3w_vec,
+    const secp256k1_pubkey *L2_3w_vec,
+    const secp256k1_pubkey *R1_3w_vec,
+    const secp256k1_pubkey *R2_3w_vec,
+    const secp256k1_pubkey *L_2w_vec,
+    const secp256k1_pubkey *R_2w_vec,
+    const unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  const size_t capacity = n + 2;
+  size_t r3 = 0, r2 = 0, terminal_n = 0;
+  size_t cur_n = n;
+  size_t global_round = 0;
+
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  secp256k1_pubkey P, RHS;
+
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  unsigned char dot[kMPT_SCALAR_SIZE] = {0};
+
+  int RHS_inited = 0;
+  int ok = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_terminal || !b_terminal || !ux || !ipa_transcript_id ||
+      n == 0)
+    return 0;
+
+  if (!secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+          n, k3, &r3, &r2, &terminal_n))
+    return 0;
+
+  if (r3 > 0 &&
+      (!L1_3w_vec || !L2_3w_vec || !R1_3w_vec || !R2_3w_vec))
+    return 0;
+
+  if (r2 > 0 && (!L_2w_vec || !R_2w_vec))
+    return 0;
+
+  for (size_t i = 0; i < terminal_n; ++i)
+  {
+    if (!scalar_is_canonical_3w(
+            a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_canonical_3w(
+            b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  for (size_t i = terminal_n; i < 3; ++i)
+  {
+    if (!scalar_is_zero(a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_zero(b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Gw));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(*Hw));
+  if (!Gw || !Hw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(*Gw));
+  memcpy(Hw, H_vec, n * sizeof(*Hw));
+  P = *P_in;
+
+  if (!derive_ipa_hybrid_v1_seed(last, ipa_transcript_id, n, k3))
+    goto cleanup;
+
+  /* ---------- explicit 3W prefix ---------- */
+  for (size_t r = 0; r < r3; ++r, ++global_round)
+  {
+    const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+    const size_t pad = padded_n - cur_n;
+    const size_t third_n = padded_n / 3;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x, last,
+            &L1_3w_vec[r], &L2_3w_vec[r],
+            &R1_3w_vec[r], &R2_3w_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_3w(
+            ctx, &P,
+            &L1_3w_vec[r], &L2_3w_vec[r],
+            &R1_3w_vec[r], &R2_3w_vec[r],
+            x, x_inv))
+      goto cleanup;
+
+    if (pad &&
+        !derive_ipa_pad_generators_hybrid_v1(
+            ctx, Gw + cur_n, Hw + cur_n, pad,
+            n, k3, global_round, 3))
+      goto cleanup;
+
+    if (!fold_generators_step_3w(
+            ctx, Gw, Hw, third_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = third_n;
+  }
+
+  /* ---------- explicit dynamic 2W suffix ---------- */
+  for (size_t r = 0; r < r2; ++r, ++global_round)
+  {
+    const size_t padded_n = bp_ipa_padded_len_2w(cur_n);
+    const size_t half_n = padded_n / 2;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge(
+            ctx, x, last, &L_2w_vec[r], &R_2w_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_2w_one(
+            ctx, &P, &L_2w_vec[r], &R_2w_vec[r],
+            x, x_inv))
+      goto cleanup;
+
+    if (padded_n != cur_n)
+    {
+      if (!derive_ipa_pad_generators_hybrid_v1(
+              ctx, &Gw[cur_n], &Hw[cur_n], 1,
+              n, k3, global_round, 2))
+        goto cleanup;
+    }
+
+    if (!fold_generators_step_2w(
+            ctx, Gw, Hw, half_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = half_n;
+  }
+
+  if (cur_n != terminal_n || cur_n == 0 || cur_n > 3)
+    goto cleanup;
+
+  if (!msm_add_checked_3w(
+          ctx, &RHS, &RHS_inited,
+          Gw, a_terminal, terminal_n))
+    goto cleanup;
+
+  if (!msm_add_checked_3w(
+          ctx, &RHS, &RHS_inited,
+          Hw, b_terminal, terminal_n))
+    goto cleanup;
+
+  if (!secp256k1_bulletproof_ipa_dot(
+          ctx, dot, a_terminal, b_terminal, terminal_n))
+    goto cleanup;
+
+  if (!add_scaled_U_term_3w(
+          ctx, &RHS, &RHS_inited, U, dot, ux))
+    goto cleanup;
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+  OPENSSL_cleanse(dot, sizeof(dot));
+
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(*Gw));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(*Hw));
+
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
 /**
  * Runs the Inner Product Argument (IPA) prover.
  * Recursively folds vectors G, H, a, and b into a single final term,
