@@ -6311,3 +6311,1774 @@ fail:
   free(R2_vec);
   return 0;
 }
+
+/* ==========================================================================
+ * Full aggregated Bulletproof integration for Hybrid IPA v1.
+ *
+ * These experimental entry points deliberately leave the existing pure-3W
+ * aggregated Bulletproof API unchanged.  k3 is supplied out-of-band while
+ * schedule selection is still under evaluation.
+ * ========================================================================== */
+
+int secp256k1_bulletproof_prove_agg_hybrid_v1(
+    const secp256k1_context *ctx, unsigned char *proof_out, size_t *proof_len,
+    const uint64_t *values, const unsigned char *blindings_flat, size_t m,
+    size_t k3, const secp256k1_pubkey *h_generator,
+    const unsigned char *context_id)
+{
+  /* ---- 0. Dimensions / Hybrid-v1 schedule ---- */
+  const size_t n = BP_TOTAL_BITS(m); /* 64*m */
+  size_t r3 = 0, r2 = 0, terminal_n = 0;
+
+  if (m == 0 || m > BP_MAX_VALUES)
+    return 0;
+  if ((n & (n - 1)) != 0)
+    return 0;
+
+  if (!secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+          n, k3, &r3, &r2, &terminal_n))
+    return 0;
+
+  /*
+   * Experimental full Hybrid-v1 proof format:
+   *   A,S,T1,T2                             4*33
+   *   r3 * (L1,L2,R1,R2)                  132*r3
+   *   r2 * (L,R)                           66*r2
+   *   terminal a[0..t-1], b[0..t-1]       64*t
+   *   t_hat,tau_x,mu                       3*32
+   *
+   * k3 is supplied out-of-band to this experimental API.  It is bound into
+   * the Hybrid-v1 transcript seed and is deliberately not serialized yet.
+   */
+  const size_t proof_size =
+      228 + 132 * r3 + 66 * r2 + 64 * terminal_n;
+
+  /*
+  * proof_len is input capacity when proof_out != NULL.
+  * Do not overwrite it before checking the caller's buffer.
+  */
+  if (proof_len == NULL)
+     return 0;
+
+  /* Size-query mode. */
+  if (proof_out == NULL)
+  {
+      *proof_len = proof_size;
+      return 1;
+  }
+
+  /* Caller supplied a buffer that is too small. */
+  if (*proof_len < proof_size)
+  {
+      *proof_len = proof_size;
+      return 0;
+  }
+
+  int ok = 0;
+
+  /* ---- 1. Allocate vectors ---- */
+  secp256k1_pubkey *G_vec =
+      (secp256k1_pubkey *)malloc(n * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *H_vec =
+      (secp256k1_pubkey *)malloc(n * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *H_prime =
+      (secp256k1_pubkey *)malloc(n * sizeof(secp256k1_pubkey));
+  unsigned char *al = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *ar = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *sl = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *sr = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *l_vec = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *r_vec = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  unsigned char *r1_vec = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+
+  const size_t r3_alloc = r3 ? r3 : 1;
+  const size_t r2_alloc = r2 ? r2 : 1;
+
+  secp256k1_pubkey *L1_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *L2_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R1_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R2_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *L_vec =
+      (secp256k1_pubkey *)malloc(r2_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R_vec =
+      (secp256k1_pubkey *)malloc(r2_alloc * sizeof(secp256k1_pubkey));
+
+  unsigned char *y_powers =
+      (unsigned char *)malloc(n * kMPT_SCALAR_SIZE); /* y^i */
+  unsigned char *z_j2 =
+      (unsigned char *)malloc(m * kMPT_SCALAR_SIZE); /* z^(j+2) */
+
+  if (!G_vec || !H_vec || !H_prime || !al || !ar || !sl || !sr || !l_vec ||
+      !r_vec || !r1_vec || !L1_vec || !L2_vec || !R1_vec || !R2_vec ||
+      !L_vec || !R_vec || !y_powers || !z_j2)
+  {
+    goto cleanup;
+  }
+
+  /* ---- 2. Scalars / points ---- */
+  secp256k1_pubkey A, S, T1, T2, U;
+
+  unsigned char alpha[kMPT_SCALAR_SIZE], rho[kMPT_SCALAR_SIZE];
+  unsigned char tau1[kMPT_SCALAR_SIZE], tau2[kMPT_SCALAR_SIZE];
+  unsigned char t1[kMPT_SCALAR_SIZE], t2[kMPT_SCALAR_SIZE];
+  unsigned char t_hat[kMPT_SCALAR_SIZE], tau_x[kMPT_SCALAR_SIZE],
+      mu[kMPT_SCALAR_SIZE];
+  unsigned char a_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+  unsigned char b_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+
+  unsigned char y[kMPT_SCALAR_SIZE], z[kMPT_SCALAR_SIZE], x[kMPT_SCALAR_SIZE];
+  unsigned char z_sq[kMPT_SCALAR_SIZE], z_neg[kMPT_SCALAR_SIZE],
+      x_sq[kMPT_SCALAR_SIZE];
+  unsigned char ux_scalar[kMPT_SCALAR_SIZE];
+  unsigned char ipa_transcript[kMPT_SCALAR_SIZE];
+
+  unsigned char one[kMPT_SCALAR_SIZE] = {0};
+  one[kMPT_SCALAR_SIZE - 1] = 1;
+  unsigned char minus_one[kMPT_SCALAR_SIZE];
+  secp256k1_mpt_scalar_negate(minus_one, one);
+  unsigned char zero[kMPT_SCALAR_SIZE] = {0};
+
+  /* ---- 3. Generator vectors ---- */
+  if (!secp256k1_mpt_get_generator_vector(ctx, G_vec, n,
+                                          (const unsigned char *)"BP_G", 4))
+    goto cleanup;
+  if (!secp256k1_mpt_get_generator_vector(ctx, H_vec, n,
+                                          (const unsigned char *)"BP_H", 4))
+    goto cleanup;
+  {
+    secp256k1_pubkey U_arr[1];
+    if (!secp256k1_mpt_get_generator_vector(ctx, U_arr, 1,
+                                            (const unsigned char *)"BP_U", 4))
+      goto cleanup;
+    U = U_arr[0];
+  }
+
+  /* ---- 4. Bit-decomposition for m values into al/ar (concat) + random sl/sr
+   * ---- */
+  for (size_t j = 0; j < m; j++)
+  {
+    uint64_t v = values[j];
+    for (size_t i = 0; i < BP_VALUE_BITS; i++)
+    {
+      const size_t k = j * BP_VALUE_BITS + i; /* 0..n-1 */
+      unsigned char *al_k = al + kMPT_SCALAR_SIZE * k;
+      unsigned char *ar_k = ar + kMPT_SCALAR_SIZE * k;
+      unsigned char *sl_k = sl + kMPT_SCALAR_SIZE * k;
+      unsigned char *sr_k = sr + kMPT_SCALAR_SIZE * k;
+
+      /* Constant-time bit decomposition to prevent cache-timing leaks */
+      unsigned char bit = (unsigned char)((v >> i) & 1);
+      unsigned char mask =
+          (unsigned char)(0 - bit); /* 0xFF if bit==1, 0x00 if bit==0 */
+
+      for (int b = 0; b < (int)kMPT_SCALAR_SIZE; b++)
+      {
+        al_k[b] = one[b] & mask;
+        ar_k[b] = minus_one[b] & ~mask;
+      }
+
+      if (!generate_random_scalar(ctx, sl_k))
+        goto cleanup;
+      if (!generate_random_scalar(ctx, sr_k))
+        goto cleanup;
+    }
+  }
+
+  if (!generate_random_scalar(ctx, alpha))
+    goto cleanup;
+  if (!generate_random_scalar(ctx, rho))
+    goto cleanup;
+
+  /* ---- 5. Commitments A and S ----
+   * A = alpha*Base + <al,G> + <ar,H>
+   * S = rho*Base   + <sl,G> + <sr,H>
+   */
+  if (!calculate_commitment_term(ctx, &A, h_generator, alpha, al, ar, G_vec,
+                                 H_vec, n))
+    goto cleanup;
+  if (!calculate_commitment_term(ctx, &S, h_generator, rho, sl, sr, G_vec,
+                                 H_vec, n))
+    goto cleanup;
+
+  /* ---- 6. Fiat–Shamir y,z ---- */
+  /*
+   * T_0 = domain || gens_digest || N (BE u32) || m (BE u32) || V_0..V_{m-1}
+   * T_1 = T_0 || A || S
+   *   y = H(T_1 || context_id)
+   *   z = H(T_1 || y || context_id)
+   *
+   * gens_digest binds the BP fixed generators (H, G_vec, H_vec) into the
+   * transcript per the spec.  N (= BP_VALUE_BITS) and m (= aggregation
+   * count) are explicit so the verifier cannot be confused into accepting
+   * a proof produced for a different range / aggregation parameter.
+   * (CMPT appendix.tex, "Fiat-Shamir Challenges".)
+   */
+  {
+    unsigned char A_ser[kMPT_PUBKEY_SIZE], S_ser[kMPT_PUBKEY_SIZE];
+    unsigned char gens_digest[kMPT_HALF_SHA_SIZE];
+    unsigned char N_be[4], m_be[4];
+    size_t len;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    int fs_ok = 1;
+
+    if (!mdctx)
+      goto cleanup;
+
+    if (!bulletproof_gens_digest(ctx, h_generator, G_vec, H_vec, n,
+                                 gens_digest))
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    bulletproof_be32_encode(N_be, (uint32_t)BP_VALUE_BITS);
+    bulletproof_be32_encode(m_be, (uint32_t)m);
+
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, A_ser, &len, &A,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, S_ser, &len, &S,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+
+    // y = H(domain || gens || N || m || V* || A || S || context)
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, "MPT_BULLETPROOF_RANGE", 21) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, gens_digest, 32) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, N_be, 4) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, m_be, 4) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+
+    for (size_t i = 0; i < m; i++)
+    {
+      secp256k1_pubkey V_temp;
+      unsigned char V_ser[kMPT_PUBKEY_SIZE];
+      size_t v_len = kMPT_PUBKEY_SIZE;
+      if (!secp256k1_bulletproof_create_commitment(
+              ctx, &V_temp, values[i], blindings_flat + kMPT_SCALAR_SIZE * i,
+              h_generator))
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+      if (!secp256k1_ec_pubkey_serialize(ctx, V_ser, &v_len, &V_temp,
+                                         SECP256K1_EC_COMPRESSED) ||
+          v_len != kMPT_PUBKEY_SIZE)
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+      if (EVP_DigestUpdate(mdctx, V_ser, kMPT_PUBKEY_SIZE) != 1)
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+    }
+
+    if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (context_id &&
+        EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestFinal_ex(mdctx, y, NULL) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    secp256k1_mpt_scalar_reduce32(y, y);
+
+    // z = H(domain || gens || N || m || V* || A || S || y || context)
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, "MPT_BULLETPROOF_RANGE", 21) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, gens_digest, 32) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, N_be, 4) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, m_be, 4) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+
+    for (size_t i = 0; i < m; i++)
+    {
+      secp256k1_pubkey V_temp;
+      unsigned char V_ser[kMPT_PUBKEY_SIZE];
+      size_t v_len = kMPT_PUBKEY_SIZE;
+      if (!secp256k1_bulletproof_create_commitment(
+              ctx, &V_temp, values[i], blindings_flat + kMPT_SCALAR_SIZE * i,
+              h_generator))
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+      if (!secp256k1_ec_pubkey_serialize(ctx, V_ser, &v_len, &V_temp,
+                                         SECP256K1_EC_COMPRESSED) ||
+          v_len != kMPT_PUBKEY_SIZE)
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+      if (EVP_DigestUpdate(mdctx, V_ser, kMPT_PUBKEY_SIZE) != 1)
+      {
+        fs_ok = 0;
+        goto fs_cleanup;
+      }
+    }
+
+    if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (context_id &&
+        EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    if (EVP_DigestFinal_ex(mdctx, z, NULL) != 1)
+    {
+      fs_ok = 0;
+      goto fs_cleanup;
+    }
+    secp256k1_mpt_scalar_reduce32(z, z);
+
+    memcpy(z_neg, z, kMPT_SCALAR_SIZE);
+    secp256k1_mpt_scalar_negate(z_neg, z_neg);
+
+  fs_cleanup:
+    EVP_MD_CTX_free(mdctx);
+    if (!fs_ok)
+      goto cleanup;
+  }
+
+  /* ---- 7. Aggregated polynomial setup ---- */
+
+  /* y_powers[k] = y^k */
+  {
+    unsigned char ypow[kMPT_SCALAR_SIZE];
+    memcpy(ypow, one, kMPT_SCALAR_SIZE);
+
+    for (size_t k = 0; k < n; k++)
+    {
+      memcpy(y_powers + kMPT_SCALAR_SIZE * k, ypow, kMPT_SCALAR_SIZE);
+      secp256k1_mpt_scalar_mul(ypow, ypow, y);
+    }
+    OPENSSL_cleanse(ypow, kMPT_SCALAR_SIZE);
+  }
+
+  /* z_j2[j] = z^(j+2) */
+  compute_z_pows_j2(ctx, (unsigned char (*)[kMPT_SCALAR_SIZE])z_j2, z, m);
+
+  /* l0, r0, r1 */
+  for (size_t block = 0; block < m; block++)
+  {
+    const unsigned char *zblk =
+        z_j2 + kMPT_SCALAR_SIZE * block; /* z^(block+2) */
+
+    for (size_t i = 0; i < BP_VALUE_BITS; i++)
+    {
+      size_t k = block * BP_VALUE_BITS + i;
+
+      unsigned char *l0 = l_vec + kMPT_SCALAR_SIZE * k;
+      unsigned char *r0 = r_vec + kMPT_SCALAR_SIZE * k;
+      unsigned char *r1 = r1_vec + kMPT_SCALAR_SIZE * k;
+
+      const unsigned char *al_k = al + kMPT_SCALAR_SIZE * k;
+      const unsigned char *ar_k = ar + kMPT_SCALAR_SIZE * k;
+      const unsigned char *sr_k = sr + kMPT_SCALAR_SIZE * k;
+      const unsigned char *yk = y_powers + kMPT_SCALAR_SIZE * k;
+
+      unsigned char two_i[kMPT_SCALAR_SIZE] = {0};
+      two_i[31 - (i >> 3)] = (unsigned char)(1u << (i & 7));
+
+      /* l0 = aL - z */
+      secp256k1_mpt_scalar_add(l0, al_k, z_neg);
+
+      /* r0 = y^k * (aR + z) + z^(block+2) * 2^i */
+      {
+        unsigned char tmp1[kMPT_SCALAR_SIZE], tmp2[kMPT_SCALAR_SIZE];
+
+        /* tmp1 = aR + z */
+        secp256k1_mpt_scalar_add(tmp1, ar_k, z);
+
+        /* r0 = y^k * tmp1 */
+        secp256k1_mpt_scalar_mul(r0, tmp1, yk);
+
+        /* tmp2 = z^(block+2) * 2^i */
+        secp256k1_mpt_scalar_mul(tmp2, zblk, two_i);
+
+        /* r0 += tmp2 */
+        secp256k1_mpt_scalar_add(r0, r0, tmp2);
+
+        OPENSSL_cleanse(tmp1, kMPT_SCALAR_SIZE);
+        OPENSSL_cleanse(tmp2, kMPT_SCALAR_SIZE);
+      }
+
+      /* r1 = sR * y^k */
+      secp256k1_mpt_scalar_mul(r1, sr_k, yk);
+    }
+  }
+
+  /* t1 = <l0, r1> + <l1, r0> */
+  {
+    unsigned char dot1[kMPT_SCALAR_SIZE], dot2[kMPT_SCALAR_SIZE];
+    if (!secp256k1_bulletproof_ipa_dot(ctx, dot1, l_vec, r1_vec, n))
+      goto cleanup;
+    if (!secp256k1_bulletproof_ipa_dot(ctx, dot2, sl, r_vec, n))
+      goto cleanup;
+    secp256k1_mpt_scalar_add(t1, dot1, dot2);
+    OPENSSL_cleanse(dot1, kMPT_SCALAR_SIZE);
+    OPENSSL_cleanse(dot2, kMPT_SCALAR_SIZE);
+  }
+
+  /* t2 = <l1, r1> */
+  if (!secp256k1_bulletproof_ipa_dot(ctx, t2, sl, r1_vec, n))
+    goto cleanup;
+
+  /* Make sure these exist before T1/T2 */
+  if (!generate_random_scalar(ctx, tau1))
+    goto cleanup;
+  if (!generate_random_scalar(ctx, tau2))
+    goto cleanup;
+
+  /* ---- 8. Commit T1, T2 ---- */
+  /* T1 = t1*G + tau1*Base   where G = G_vec[0].
+   * When t1 == 0 the t1*G term is the point at infinity (which libsecp256k1
+   * cannot emit), so commit T1 = tau1*Base directly. */
+  {
+    secp256k1_pubkey tG, tB;
+    const secp256k1_pubkey *pts[2];
+
+    tB = *h_generator;
+    if (!mpt_ct_pubkey_tweak_mul(ctx, &tB, tau1))
+      goto cleanup;
+
+    if (memcmp(t1, zero, kMPT_SCALAR_SIZE) == 0)
+    {
+      T1 = tB;
+    }
+    else
+    {
+      if (!secp256k1_ec_pubkey_create(ctx, &tG, t1))
+        goto cleanup;
+      pts[0] = &tG;
+      pts[1] = &tB;
+      if (!secp256k1_ec_pubkey_combine(ctx, &T1, pts, 2))
+        goto cleanup;
+    }
+  }
+
+  /* T2 = t2*G + tau2*Base. Same t2==0 short-circuit as above. */
+  {
+    secp256k1_pubkey tG, tB;
+    const secp256k1_pubkey *pts[2];
+
+    tB = *h_generator;
+    if (!mpt_ct_pubkey_tweak_mul(ctx, &tB, tau2))
+      goto cleanup;
+
+    if (memcmp(t2, zero, kMPT_SCALAR_SIZE) == 0)
+    {
+      T2 = tB;
+    }
+    else
+    {
+      if (!secp256k1_ec_pubkey_create(ctx, &tG, t2))
+        goto cleanup;
+      pts[0] = &tG;
+      pts[1] = &tB;
+      if (!secp256k1_ec_pubkey_combine(ctx, &T2, pts, 2))
+        goto cleanup;
+    }
+  }
+
+  /* ---- 9. Challenge x ---- */
+  /* x = H(A || S || y || z || T1 || T2 || context_id) */
+  {
+    unsigned char A_ser[kMPT_PUBKEY_SIZE], S_ser[kMPT_PUBKEY_SIZE],
+        T1_ser[kMPT_PUBKEY_SIZE], T2_ser[kMPT_PUBKEY_SIZE];
+    size_t len;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    int fs_ok = 0;
+
+    if (!mdctx)
+      goto cleanup;
+
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, A_ser, &len, &A,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto fs_x_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, S_ser, &len, &S,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto fs_x_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T1_ser, &len, &T1,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto fs_x_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T2_ser, &len, &T2,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto fs_x_cleanup;
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, z, kMPT_SCALAR_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, T1_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestUpdate(mdctx, T2_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (context_id &&
+        EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+      goto fs_x_cleanup;
+    if (EVP_DigestFinal_ex(mdctx, x, NULL) != 1)
+      goto fs_x_cleanup;
+
+    secp256k1_mpt_scalar_reduce32(x, x);
+    if (memcmp(x, zero, kMPT_SCALAR_SIZE) == 0)
+      goto fs_x_cleanup; /* avoid infinity later */
+
+    fs_ok = 1;
+
+  fs_x_cleanup:
+    EVP_MD_CTX_free(mdctx);
+    if (!fs_ok)
+      goto cleanup;
+  }
+
+  /* ---- 10. Evaluate l(x), r(x), t_hat ---- */
+  for (size_t k = 0; k < n; k++)
+  {
+    unsigned char tmp[kMPT_SCALAR_SIZE];
+
+    /* l = l0 + sL*x */
+    secp256k1_mpt_scalar_mul(tmp, sl + kMPT_SCALAR_SIZE * k, x);
+    secp256k1_mpt_scalar_add(l_vec + kMPT_SCALAR_SIZE * k,
+                             l_vec + kMPT_SCALAR_SIZE * k, tmp);
+
+    /* r = r0 + r1*x */
+    secp256k1_mpt_scalar_mul(tmp, r1_vec + kMPT_SCALAR_SIZE * k, x);
+    secp256k1_mpt_scalar_add(r_vec + kMPT_SCALAR_SIZE * k,
+                             r_vec + kMPT_SCALAR_SIZE * k, tmp);
+
+    OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+  }
+
+  if (!secp256k1_bulletproof_ipa_dot(ctx, t_hat, l_vec, r_vec, n))
+    goto cleanup;
+
+  /* ---- 11. tau_x and mu (aggregation changes tau_x) ---- */
+  secp256k1_mpt_scalar_mul(x_sq, x, x);
+
+  /* tau_x = tau2*x^2 + tau1*x + sum_j z^(j+2) * blinding_j */
+  secp256k1_mpt_scalar_mul(tau_x, tau2, x_sq);
+  {
+    unsigned char tmp[kMPT_SCALAR_SIZE];
+    secp256k1_mpt_scalar_mul(tmp, tau1, x);
+    secp256k1_mpt_scalar_add(tau_x, tau_x, tmp);
+
+    /* + sum_j z^(j+2) * r_j */
+    for (size_t j = 0; j < m; j++)
+    {
+      unsigned char add[kMPT_SCALAR_SIZE];
+      secp256k1_mpt_scalar_mul(add, z_j2 + kMPT_SCALAR_SIZE * j,
+                               blindings_flat + kMPT_SCALAR_SIZE * j);
+      secp256k1_mpt_scalar_add(tau_x, tau_x, add);
+      OPENSSL_cleanse(add, kMPT_SCALAR_SIZE);
+    }
+
+    OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+  }
+
+  /* mu = alpha + rho*x */
+  {
+    unsigned char tmp[kMPT_SCALAR_SIZE];
+    secp256k1_mpt_scalar_mul(tmp, rho, x);
+    secp256k1_mpt_scalar_add(mu, alpha, tmp);
+    OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+  }
+
+  /* ---- 12. IPA transcript + ux (binding), and H' normalization ---- */
+
+  /* 12a. Build a stable IPA transcript seed (32 bytes).
+   *
+   * IMPORTANT:
+   *  - Prover and verifier MUST hash the exact same bytes in the exact same
+   * order.
+   *  - Use only public elements that both sides already know.
+   *  - Do NOT depend on internal intermediate buffers.
+   *
+   * Minimal, safe choice: A||S||T1||T2 || y||z||x || t_hat || context_id
+   * (All points are serialized compressed 33 bytes.)
+   */
+  {
+    unsigned char A_ser[kMPT_PUBKEY_SIZE], S_ser[kMPT_PUBKEY_SIZE],
+        T1_ser[kMPT_PUBKEY_SIZE], T2_ser[kMPT_PUBKEY_SIZE];
+    size_t ser_len;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    int fs_ok = 0;
+
+    if (!mdctx)
+      goto cleanup;
+
+    ser_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, A_ser, &ser_len, &A,
+                                       SECP256K1_EC_COMPRESSED) ||
+        ser_len != kMPT_PUBKEY_SIZE)
+      goto fs_ipa_cleanup;
+
+    ser_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, S_ser, &ser_len, &S,
+                                       SECP256K1_EC_COMPRESSED) ||
+        ser_len != kMPT_PUBKEY_SIZE)
+      goto fs_ipa_cleanup;
+
+    ser_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T1_ser, &ser_len, &T1,
+                                       SECP256K1_EC_COMPRESSED) ||
+        ser_len != kMPT_PUBKEY_SIZE)
+      goto fs_ipa_cleanup;
+
+    ser_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T2_ser, &ser_len, &T2,
+                                       SECP256K1_EC_COMPRESSED) ||
+        ser_len != kMPT_PUBKEY_SIZE)
+      goto fs_ipa_cleanup;
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+      goto fs_ipa_cleanup;
+    static const unsigned char ipa_domain[] =
+        "MPT_BP_IPA_HYBRID_V1_BASE";
+    if (EVP_DigestUpdate(mdctx, ipa_domain, sizeof(ipa_domain) - 1) != 1)
+      goto fs_ipa_cleanup;
+
+    if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, T1_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, T2_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, z, kMPT_SCALAR_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, x, kMPT_SCALAR_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (EVP_DigestUpdate(mdctx, t_hat, kMPT_SCALAR_SIZE) != 1)
+      goto fs_ipa_cleanup;
+    if (context_id &&
+        EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+      goto fs_ipa_cleanup;
+
+    if (EVP_DigestFinal_ex(mdctx, ipa_transcript, NULL) != 1)
+      goto fs_ipa_cleanup;
+
+    fs_ok = 1;
+
+  fs_ipa_cleanup:
+    EVP_MD_CTX_free(mdctx);
+    if (!fs_ok)
+      goto cleanup;
+  }
+
+  /* 12b. Derive u_x = H(ipa_transcript || t_hat) reduced to scalar. */
+  if (!derive_ipa_binding_challenge(ctx, ux_scalar, ipa_transcript, t_hat))
+    goto cleanup;
+
+  /* 12c. Normalize H: H'[k] = H[k] * y^{-k}.
+   *
+   * NOTE:
+   *  - Requires y != 0.
+   *  - If y==0 (mod q), abort (cannot invert).
+   */
+  {
+    unsigned char y_inv[kMPT_SCALAR_SIZE];
+    unsigned char y_inv_pow[kMPT_SCALAR_SIZE]; /* (y^{-1})^k */
+    if (memcmp(y, zero, kMPT_SCALAR_SIZE) == 0)
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(y_inv, y))
+      goto cleanup;
+    memcpy(y_inv_pow, one, kMPT_SCALAR_SIZE);
+
+    for (size_t k = 0; k < n; k++)
+    {
+      H_prime[k] = H_vec[k];
+      /* H_prime[k] = H_vec[k] * (y^{-1})^k */
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &H_prime[k], y_inv_pow))
+        goto cleanup;
+      secp256k1_mpt_scalar_mul(y_inv_pow, y_inv_pow, y_inv);
+    }
+
+    OPENSSL_cleanse(y_inv, kMPT_SCALAR_SIZE);
+    OPENSSL_cleanse(y_inv_pow, kMPT_SCALAR_SIZE);
+  }
+
+  /* 12d. Run Hybrid-v1 IPA prover */
+  {
+    size_t r3_used = 0, r2_used = 0, terminal_used = 0;
+
+    if (!secp256k1_bulletproof_run_ipa_prover_hybrid_v1(
+            ctx, &U, G_vec, H_prime, l_vec, r_vec,
+            n, k3, ipa_transcript, ux_scalar,
+            r3 ? L1_vec : NULL,
+            r3 ? L2_vec : NULL,
+            r3 ? R1_vec : NULL,
+            r3 ? R2_vec : NULL,
+            r3, &r3_used,
+            r2 ? L_vec : NULL,
+            r2 ? R_vec : NULL,
+            r2, &r2_used,
+            a_terminal, b_terminal, &terminal_used))
+      goto cleanup;
+
+    if (r3_used != r3 || r2_used != r2 || terminal_used != terminal_n)
+      goto cleanup;
+  }
+
+  /* ---- 13. Serialize Hybrid-v1 proof ---- */
+  {
+    const size_t expected = proof_size;
+
+    /* Standard pattern: query size only */
+    if (proof_out == NULL)
+    {
+      if (proof_len)
+        *proof_len = expected;
+      ok = 1;
+      goto cleanup;
+    }
+
+    if (proof_len == NULL)
+      goto cleanup;
+
+    if (*proof_len < expected)
+    {
+      *proof_len = expected;
+      goto cleanup; /* not enough space */
+    }
+
+    unsigned char *ptr = proof_out;
+    size_t ser_len;
+
+#define SER_PT(P)                                                              \
+  do                                                                           \
+  {                                                                            \
+    ser_len = kMPT_PUBKEY_SIZE;                                                \
+    if (!secp256k1_ec_pubkey_serialize(ctx, ptr, &ser_len, &(P),               \
+                                       SECP256K1_EC_COMPRESSED))               \
+      goto cleanup;                                                            \
+    if (ser_len != kMPT_PUBKEY_SIZE)                                           \
+      goto cleanup;                                                            \
+    ptr += kMPT_PUBKEY_SIZE;                                                   \
+  } while (0)
+
+    SER_PT(A);
+    SER_PT(S);
+    SER_PT(T1);
+    SER_PT(T2);
+
+    /* 3W prefix, round-major: L1,L2,R1,R2. */
+    for (size_t r = 0; r < r3; r++)
+    {
+      SER_PT(L1_vec[r]);
+      SER_PT(L2_vec[r]);
+      SER_PT(R1_vec[r]);
+      SER_PT(R2_vec[r]);
+    }
+
+    /* Dynamic 2W suffix, round-major: L,R. */
+    for (size_t r = 0; r < r2; r++)
+    {
+      SER_PT(L_vec[r]);
+      SER_PT(R_vec[r]);
+    }
+
+    /* Only active terminal coordinates are serialized. */
+    memcpy(ptr, a_terminal, terminal_n * kMPT_SCALAR_SIZE);
+    ptr += terminal_n * kMPT_SCALAR_SIZE;
+    memcpy(ptr, b_terminal, terminal_n * kMPT_SCALAR_SIZE);
+    ptr += terminal_n * kMPT_SCALAR_SIZE;
+    memcpy(ptr, t_hat, kMPT_SCALAR_SIZE);
+    ptr += kMPT_SCALAR_SIZE;
+    memcpy(ptr, tau_x, kMPT_SCALAR_SIZE);
+    ptr += kMPT_SCALAR_SIZE;
+    memcpy(ptr, mu, kMPT_SCALAR_SIZE);
+    ptr += kMPT_SCALAR_SIZE;
+
+#undef SER_PT
+
+    /* Final sanity */
+    if ((size_t)(ptr - proof_out) != expected)
+      goto cleanup;
+
+    *proof_len = expected;
+  }
+
+  ok = 1;
+
+cleanup:
+
+  /* wipe sensitive scalars; free buffers */
+  if (al)
+    OPENSSL_cleanse(al, n * kMPT_SCALAR_SIZE);
+  if (ar)
+    OPENSSL_cleanse(ar, n * kMPT_SCALAR_SIZE);
+  if (sl)
+    OPENSSL_cleanse(sl, n * kMPT_SCALAR_SIZE);
+  if (sr)
+    OPENSSL_cleanse(sr, n * kMPT_SCALAR_SIZE);
+  if (l_vec)
+    OPENSSL_cleanse(l_vec, n * kMPT_SCALAR_SIZE);
+  if (r_vec)
+    OPENSSL_cleanse(r_vec, n * kMPT_SCALAR_SIZE);
+  if (r1_vec)
+    OPENSSL_cleanse(r1_vec, n * kMPT_SCALAR_SIZE);
+
+  OPENSSL_cleanse(alpha, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(rho, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(tau1, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(tau2, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(t1, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(t2, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(t_hat, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(tau_x, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(mu, kMPT_SCALAR_SIZE);
+
+  OPENSSL_cleanse(y, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(z, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(x, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(z_sq, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(z_neg, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(x_sq, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(ux_scalar, kMPT_SCALAR_SIZE);
+  OPENSSL_cleanse(ipa_transcript, kMPT_SCALAR_SIZE);
+
+  if (G_vec)
+  {
+    OPENSSL_cleanse(G_vec, n * sizeof(secp256k1_pubkey));
+    free(G_vec);
+  }
+  if (H_vec)
+  {
+    OPENSSL_cleanse(H_vec, n * sizeof(secp256k1_pubkey));
+    free(H_vec);
+  }
+  if (H_prime)
+  {
+    OPENSSL_cleanse(H_prime, n * sizeof(secp256k1_pubkey));
+    free(H_prime);
+  }
+
+  free(al);
+  free(ar);
+  free(sl);
+  free(sr);
+  free(l_vec);
+  free(r_vec);
+  free(r1_vec);
+
+  if (L1_vec)
+  {
+    OPENSSL_cleanse(L1_vec, r3_alloc * sizeof(secp256k1_pubkey));
+    free(L1_vec);
+  }
+  if (L2_vec)
+  {
+    OPENSSL_cleanse(L2_vec, r3_alloc * sizeof(secp256k1_pubkey));
+    free(L2_vec);
+  }
+  if (R1_vec)
+  {
+    OPENSSL_cleanse(R1_vec, r3_alloc * sizeof(secp256k1_pubkey));
+    free(R1_vec);
+  }
+  if (R2_vec)
+  {
+    OPENSSL_cleanse(R2_vec, r3_alloc * sizeof(secp256k1_pubkey));
+    free(R2_vec);
+  }
+  if (L_vec)
+  {
+    OPENSSL_cleanse(L_vec, r2_alloc * sizeof(secp256k1_pubkey));
+    free(L_vec);
+  }
+  if (R_vec)
+  {
+    OPENSSL_cleanse(R_vec, r2_alloc * sizeof(secp256k1_pubkey));
+    free(R_vec);
+  }
+
+  OPENSSL_cleanse(a_terminal, sizeof(a_terminal));
+  OPENSSL_cleanse(b_terminal, sizeof(b_terminal));
+
+  if (y_powers)
+  {
+    OPENSSL_cleanse(y_powers, n * kMPT_SCALAR_SIZE);
+    free(y_powers);
+  }
+  if (z_j2)
+  {
+    OPENSSL_cleanse(z_j2, m * kMPT_SCALAR_SIZE);
+    free(z_j2);
+  }
+
+  return ok;
+}
+
+int secp256k1_bulletproof_verify_agg_hybrid_v1(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec, /* length n = 64*m */
+    const secp256k1_pubkey *H_vec, /* length n = 64*m */
+    const unsigned char *proof, size_t proof_len,
+    const secp256k1_pubkey *commitment_C_vec, /* length m */
+    size_t m, size_t k3, const secp256k1_pubkey *h_generator,
+    const unsigned char *context_id)
+{
+  if (!ctx || !G_vec || !H_vec || !proof || !commitment_C_vec || !h_generator)
+    return 0;
+  if (m == 0 || m > BP_MAX_VALUES)
+    return 0;
+  /* Aggregation requires n = 64*m to be power-of-two => m must be power-of-two.
+   */
+  if ((m & (m - 1)) != 0)
+    return 0;
+
+  const size_t n = BP_TOTAL_BITS(m); /* 64*m */
+  size_t r3 = 0, r2 = 0, terminal_n = 0;
+
+  if (!secp256k1_bulletproof_ipa_hybrid_v1_schedule(
+          n, k3, &r3, &r2, &terminal_n))
+    return 0;
+
+  const size_t expected_len =
+      228 + 132 * r3 + 66 * r2 + 64 * terminal_n;
+  if (proof_len != expected_len)
+    return 0;
+
+  /* --- Unpack proof --- */
+  secp256k1_pubkey A, S, T1, T2;
+  secp256k1_pubkey U;
+
+  const size_t r3_alloc = r3 ? r3 : 1;
+  const size_t r2_alloc = r2 ? r2 : 1;
+
+  secp256k1_pubkey *L1_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *L2_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R1_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R2_vec =
+      (secp256k1_pubkey *)malloc(r3_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *L_vec =
+      (secp256k1_pubkey *)malloc(r2_alloc * sizeof(secp256k1_pubkey));
+  secp256k1_pubkey *R_vec =
+      (secp256k1_pubkey *)malloc(r2_alloc * sizeof(secp256k1_pubkey));
+  if (!L1_vec || !L2_vec || !R1_vec || !R2_vec || !L_vec || !R_vec)
+  {
+    free(L1_vec);
+    free(L2_vec);
+    free(R1_vec);
+    free(R2_vec);
+    free(L_vec);
+    free(R_vec);
+    return 0;
+  }
+
+  /* Heap allocations whose lifetime spans multiple goto-fail sites.
+   * Declared here, ahead of the first `goto fail`, and NULL-initialized so the
+   * centralized free at the `fail:` label is a no-op when execution exits
+   * before the actual malloc. */
+  unsigned char *y_powers = NULL;
+  unsigned char *y_inv_powers = NULL;
+  unsigned char (*y_block_sum)[kMPT_SCALAR_SIZE] = NULL;
+
+  unsigned char a_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+  unsigned char b_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+  unsigned char t_hat[kMPT_SCALAR_SIZE], tau_x[kMPT_SCALAR_SIZE],
+      mu[kMPT_SCALAR_SIZE];
+
+  unsigned char y[kMPT_SCALAR_SIZE], z[kMPT_SCALAR_SIZE], x[kMPT_SCALAR_SIZE];
+  unsigned char ux_scalar[kMPT_SCALAR_SIZE];
+  unsigned char z_sq[kMPT_SCALAR_SIZE];
+
+  const unsigned char *ptr = proof;
+
+  if (!secp256k1_ec_pubkey_parse(ctx, &A, ptr, kMPT_PUBKEY_SIZE))
+    goto fail;
+  ptr += kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_parse(ctx, &S, ptr, kMPT_PUBKEY_SIZE))
+    goto fail;
+  ptr += kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_parse(ctx, &T1, ptr, kMPT_PUBKEY_SIZE))
+    goto fail;
+  ptr += kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_parse(ctx, &T2, ptr, kMPT_PUBKEY_SIZE))
+    goto fail;
+  ptr += kMPT_PUBKEY_SIZE;
+
+  for (size_t i = 0; i < r3; i++)
+  {
+    if (!secp256k1_ec_pubkey_parse(ctx, &L1_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_parse(ctx, &L2_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_parse(ctx, &R1_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_parse(ctx, &R2_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+  }
+
+  for (size_t i = 0; i < r2; i++)
+  {
+    if (!secp256k1_ec_pubkey_parse(ctx, &L_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_parse(ctx, &R_vec[i], ptr, kMPT_PUBKEY_SIZE))
+      goto fail;
+    ptr += kMPT_PUBKEY_SIZE;
+  }
+
+  memcpy(a_terminal, ptr, terminal_n * kMPT_SCALAR_SIZE);
+  ptr += terminal_n * kMPT_SCALAR_SIZE;
+  memcpy(b_terminal, ptr, terminal_n * kMPT_SCALAR_SIZE);
+  ptr += terminal_n * kMPT_SCALAR_SIZE;
+  memcpy(t_hat, ptr, kMPT_SCALAR_SIZE);
+  ptr += kMPT_SCALAR_SIZE;
+  memcpy(tau_x, ptr, kMPT_SCALAR_SIZE);
+  ptr += kMPT_SCALAR_SIZE;
+  memcpy(mu, ptr, kMPT_SCALAR_SIZE);
+  ptr += kMPT_SCALAR_SIZE;
+
+  /* Proof scalars must be canonical field elements; zero is allowed. */
+  for (size_t i = 0; i < terminal_n; ++i)
+  {
+    if (!scalar_is_canonical_3w(a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_canonical_3w(b_terminal + i * kMPT_SCALAR_SIZE))
+      goto fail;
+  }
+  if (!scalar_is_canonical_3w(t_hat) ||
+      !scalar_is_canonical_3w(tau_x) ||
+      !scalar_is_canonical_3w(mu))
+    goto fail;
+
+  if ((size_t)(ptr - proof) != expected_len)
+    goto fail;
+
+  /* Derive U */
+  {
+    secp256k1_pubkey U_arr[1];
+    if (!secp256k1_mpt_get_generator_vector(ctx, U_arr, 1,
+                                            (const unsigned char *)"BP_U", 4))
+      goto fail;
+    U = U_arr[0];
+  }
+
+  /* --- Fiat–Shamir: y,z,x ---
+   *
+   * T_0 = domain || gens_digest || N (BE u32) || m (BE u32) || C_0..C_{m-1}
+   * T_1 = T_0 || A || S
+   *   y = H(T_1 || context_id)
+   *   z = H(T_1 || y || context_id)
+   *
+   * MUST agree byte-for-byte with the prover; see the matching block in
+   * secp256k1_bulletproof_prove_agg.
+   */
+  unsigned char A_ser[kMPT_PUBKEY_SIZE], S_ser[kMPT_PUBKEY_SIZE],
+      T1_ser[kMPT_PUBKEY_SIZE], T2_ser[kMPT_PUBKEY_SIZE];
+  unsigned char gens_digest[kMPT_HALF_SHA_SIZE];
+  unsigned char N_be[4], m_be[4];
+  size_t slen;
+  EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+  int fs_ok = 0;
+
+  if (!mdctx)
+    goto fail;
+
+  if (!bulletproof_gens_digest(ctx, h_generator, G_vec, H_vec, n, gens_digest))
+    goto fs_fail;
+  bulletproof_be32_encode(N_be, (uint32_t)BP_VALUE_BITS);
+  bulletproof_be32_encode(m_be, (uint32_t)m);
+
+  /* Serialize A,S,T1,T2 */
+  slen = kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_serialize(ctx, A_ser, &slen, &A,
+                                     SECP256K1_EC_COMPRESSED) ||
+      slen != kMPT_PUBKEY_SIZE)
+    goto fs_fail;
+  slen = kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_serialize(ctx, S_ser, &slen, &S,
+                                     SECP256K1_EC_COMPRESSED) ||
+      slen != kMPT_PUBKEY_SIZE)
+    goto fs_fail;
+  slen = kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_serialize(ctx, T1_ser, &slen, &T1,
+                                     SECP256K1_EC_COMPRESSED) ||
+      slen != kMPT_PUBKEY_SIZE)
+    goto fs_fail;
+  slen = kMPT_PUBKEY_SIZE;
+  if (!secp256k1_ec_pubkey_serialize(ctx, T2_ser, &slen, &T2,
+                                     SECP256K1_EC_COMPRESSED) ||
+      slen != kMPT_PUBKEY_SIZE)
+    goto fs_fail;
+
+  /* ---------------- y = H(domain || gens || N || m || C_i || A || S ||
+   * context) ---------------- */
+  if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, "MPT_BULLETPROOF_RANGE", 21) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, gens_digest, 32) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, N_be, 4) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, m_be, 4) != 1)
+    goto fs_fail;
+
+  for (size_t i = 0; i < m; i++)
+  {
+    unsigned char C_ser[kMPT_PUBKEY_SIZE];
+    size_t c_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, C_ser, &c_len, &commitment_C_vec[i],
+                                       SECP256K1_EC_COMPRESSED) ||
+        c_len != kMPT_PUBKEY_SIZE)
+      goto fs_fail;
+    if (EVP_DigestUpdate(mdctx, C_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_fail;
+  }
+
+  if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (context_id && EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestFinal_ex(mdctx, y, NULL) != 1)
+    goto fs_fail;
+
+  secp256k1_mpt_scalar_reduce32(y, y);
+
+  /* ---------------- z = H(domain || gens || N || m || C_i || A || S || y ||
+   * context) ---------------- */
+  if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, "MPT_BULLETPROOF_RANGE", 21) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, gens_digest, 32) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, N_be, 4) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, m_be, 4) != 1)
+    goto fs_fail;
+
+  for (size_t i = 0; i < m; i++)
+  {
+    unsigned char C_ser[kMPT_PUBKEY_SIZE];
+    size_t c_len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, C_ser, &c_len, &commitment_C_vec[i],
+                                       SECP256K1_EC_COMPRESSED) ||
+        c_len != kMPT_PUBKEY_SIZE)
+      goto fs_fail;
+    if (EVP_DigestUpdate(mdctx, C_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto fs_fail;
+  }
+
+  if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (context_id && EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestFinal_ex(mdctx, z, NULL) != 1)
+    goto fs_fail;
+
+  secp256k1_mpt_scalar_reduce32(z, z);
+
+  if (!secp256k1_ec_seckey_verify(ctx, y) ||
+      !secp256k1_ec_seckey_verify(ctx, z))
+    goto fs_fail;
+
+  /* Powers */
+  y_powers = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  y_inv_powers = (unsigned char *)malloc(n * kMPT_SCALAR_SIZE);
+  if (!y_powers || !y_inv_powers)
+    goto fs_fail;
+
+  unsigned char y_inv[kMPT_SCALAR_SIZE];
+  scalar_vector_powers(ctx, (unsigned char (*)[kMPT_SCALAR_SIZE])y_powers, y,
+                       n);
+  secp256k1_mpt_scalar_inverse(y_inv, y);
+  scalar_vector_powers(ctx, (unsigned char (*)[kMPT_SCALAR_SIZE])y_inv_powers,
+                       y_inv, n);
+
+  /* ---------------- x = H(A || S || y || z || T1 || T2 || context)
+   * ---------------- */
+  if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, z, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, T1_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestUpdate(mdctx, T2_ser, kMPT_PUBKEY_SIZE) != 1)
+    goto fs_fail;
+  if (context_id && EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+    goto fs_fail;
+  if (EVP_DigestFinal_ex(mdctx, x, NULL) != 1)
+    goto fs_fail;
+
+  secp256k1_mpt_scalar_reduce32(x, x);
+
+  if (!secp256k1_ec_seckey_verify(ctx, x))
+    goto fs_fail;
+
+  fs_ok = 1;
+
+fs_fail:
+  EVP_MD_CTX_free(mdctx);
+  if (!fs_ok)
+    goto fail;
+
+  /* z^2 */
+  secp256k1_mpt_scalar_mul(z_sq, z, z);
+
+  /* =========================================================================
+   * Step 3: Verify polynomial identity:
+   *   t_hat*G + tau_x*H == (sum_j z^(j+2) * V_j) + delta(y,z)*G + x*T1 + x^2*T2
+   * =========================================================================
+   */
+
+  /* --- delta(y,z) for aggregation --- */
+  y_block_sum =
+      (unsigned char (*)[kMPT_SCALAR_SIZE])malloc(m * kMPT_SCALAR_SIZE);
+  if (!y_block_sum)
+    goto fail;
+
+  unsigned char two_sum[kMPT_SCALAR_SIZE];
+  compute_delta_scalars(ctx, y_block_sum, two_sum, y, m);
+
+  unsigned char delta[kMPT_SCALAR_SIZE] = {0};
+  unsigned char sum_y_all[kMPT_SCALAR_SIZE] = {0};
+
+  /* sum_y_all = sum_{k=0}^{n-1} y^k = sum_j y_block_sum[j] */
+  for (size_t j = 0; j < m; j++)
+  {
+    secp256k1_mpt_scalar_add(sum_y_all, sum_y_all, y_block_sum[j]);
+  }
+
+  /* delta += (z - z^2) * sum_y_all */
+  {
+    unsigned char z_minus_z2[kMPT_SCALAR_SIZE], tmp[kMPT_SCALAR_SIZE];
+    secp256k1_mpt_scalar_sub(z_minus_z2, z, z_sq);
+    secp256k1_mpt_scalar_mul(tmp, z_minus_z2, sum_y_all);
+    secp256k1_mpt_scalar_add(delta, delta, tmp);
+    OPENSSL_cleanse(z_minus_z2, kMPT_SCALAR_SIZE);
+    OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+  }
+
+  /* delta -= sum_{j=0}^{m-1} z^(j+3) * two_sum */
+  for (size_t j = 0; j < m; j++)
+  {
+    unsigned char z_j3[kMPT_SCALAR_SIZE], tmp[kMPT_SCALAR_SIZE];
+    scalar_pow_u32(ctx, z_j3, z, (unsigned int)(j + 3));
+    secp256k1_mpt_scalar_mul(tmp, z_j3, two_sum);
+    secp256k1_mpt_scalar_negate(tmp, tmp);
+    secp256k1_mpt_scalar_add(delta, delta, tmp);
+    OPENSSL_cleanse(z_j3, kMPT_SCALAR_SIZE);
+    OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+  }
+
+  OPENSSL_cleanse(sum_y_all, kMPT_SCALAR_SIZE);
+
+  /* LHS = t_hat*G + tau_x*Base */
+  secp256k1_pubkey LHS;
+  {
+    unsigned char zero32[kMPT_SCALAR_SIZE] = {0};
+    int have_t = 0, have_tau = 0;
+    secp256k1_pubkey tG, tauH;
+
+    if (memcmp(t_hat, zero32, kMPT_SCALAR_SIZE) != 0)
+    {
+      if (!secp256k1_ec_pubkey_create(ctx, &tG, t_hat))
+      {
+        goto fail;
+      }
+      have_t = 1;
+    }
+    if (memcmp(tau_x, zero32, kMPT_SCALAR_SIZE) != 0)
+    {
+      tauH = *h_generator;
+      if (!mpt_ct_pubkey_tweak_mul(ctx, &tauH, tau_x))
+      {
+        goto fail;
+      }
+      have_tau = 1;
+    }
+    if (have_t && have_tau)
+    {
+      const secp256k1_pubkey *pts[2] = {&tG, &tauH};
+      if (!secp256k1_ec_pubkey_combine(ctx, &LHS, pts, 2))
+      {
+        goto fail;
+      }
+    }
+    else if (have_t)
+    {
+      LHS = tG;
+    }
+    else if (have_tau)
+    {
+      LHS = tauH;
+    }
+    else
+    {
+      goto fail;
+    }
+  }
+
+  /* RHS = (sum_j z^(j+2) V_j) + delta*G + x*T1 + x^2*T2 */
+  secp256k1_pubkey RHS;
+  {
+    secp256k1_pubkey acc, tmpP;
+    int inited = 0;
+    unsigned char zero32[kMPT_SCALAR_SIZE] = {0};
+
+    /* sum_j z^(j+2) V_j */
+    for (size_t j = 0; j < m; j++)
+    {
+      unsigned char z_j2[kMPT_SCALAR_SIZE];
+      scalar_pow_u32(ctx, z_j2, z, (unsigned int)(j + 2));
+
+      if (memcmp(z_j2, zero32, kMPT_SCALAR_SIZE) != 0)
+      {
+        tmpP = commitment_C_vec[j];
+        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmpP, z_j2))
+        {
+          goto fail;
+        }
+        if (!add_term(ctx, &acc, &inited, &tmpP))
+        {
+          goto fail;
+        }
+      }
+      OPENSSL_cleanse(z_j2, kMPT_SCALAR_SIZE);
+    }
+
+    /* + delta*G */
+    if (!scalar_is_zero(delta))
+    {
+      secp256k1_pubkey deltaG;
+      if (!secp256k1_ec_pubkey_create(ctx, &deltaG, delta))
+        goto fail;
+      if (!add_term(ctx, &acc, &inited, &deltaG))
+        goto fail;
+    }
+
+    /* + x*T1 */
+    if (memcmp(x, zero32, kMPT_SCALAR_SIZE) != 0)
+    {
+      tmpP = T1;
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmpP, x))
+      {
+        goto fail;
+      }
+      if (!add_term(ctx, &acc, &inited, &tmpP))
+      {
+        goto fail;
+      }
+    }
+
+    /* + x^2*T2 */
+    unsigned char x_sq[kMPT_SCALAR_SIZE];
+    secp256k1_mpt_scalar_mul(x_sq, x, x);
+    if (memcmp(x_sq, zero32, kMPT_SCALAR_SIZE) != 0)
+    {
+      tmpP = T2;
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmpP, x_sq))
+      {
+        OPENSSL_cleanse(x_sq, kMPT_SCALAR_SIZE);
+        goto fail;
+      }
+      if (!add_term(ctx, &acc, &inited, &tmpP))
+      {
+        OPENSSL_cleanse(x_sq, kMPT_SCALAR_SIZE);
+        goto fail;
+      }
+    }
+    OPENSSL_cleanse(x_sq, kMPT_SCALAR_SIZE);
+
+    if (!inited)
+    {
+      goto fail;
+    }
+    RHS = acc;
+  }
+
+  if (!pubkey_equal(ctx, &LHS, &RHS))
+  {
+    goto fail;
+  }
+
+  /* =========================================================================
+   * Step 4: Build P and Verify IPA
+   * =========================================================================
+   */
+
+  unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE];
+  {
+    unsigned char A_ser[kMPT_PUBKEY_SIZE], S_ser[kMPT_PUBKEY_SIZE],
+        T1_ser[kMPT_PUBKEY_SIZE], T2_ser[kMPT_PUBKEY_SIZE];
+    size_t len;
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    int ok = 0;
+    unsigned int md_len = 0;
+
+    if (!mdctx)
+      goto fail;
+
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, A_ser, &len, &A,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto ipa_tid_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, S_ser, &len, &S,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto ipa_tid_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T1_ser, &len, &T1,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto ipa_tid_cleanup;
+    len = kMPT_PUBKEY_SIZE;
+    if (!secp256k1_ec_pubkey_serialize(ctx, T2_ser, &len, &T2,
+                                       SECP256K1_EC_COMPRESSED) ||
+        len != kMPT_PUBKEY_SIZE)
+      goto ipa_tid_cleanup;
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1)
+      goto ipa_tid_cleanup;
+    static const unsigned char ipa_domain[] =
+        "MPT_BP_IPA_HYBRID_V1_BASE";
+    if (EVP_DigestUpdate(mdctx, ipa_domain, sizeof(ipa_domain) - 1) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, A_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, S_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, T1_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, T2_ser, kMPT_PUBKEY_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, y, kMPT_SCALAR_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, z, kMPT_SCALAR_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, x, kMPT_SCALAR_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestUpdate(mdctx, t_hat, kMPT_SCALAR_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (context_id &&
+        EVP_DigestUpdate(mdctx, context_id, kMPT_SCALAR_SIZE) != 1)
+      goto ipa_tid_cleanup;
+    if (EVP_DigestFinal_ex(mdctx, ipa_transcript_id, &md_len) != 1)
+      goto ipa_tid_cleanup;
+    if (md_len != kMPT_HALF_SHA_SIZE)
+      goto ipa_tid_cleanup;
+
+    ok = 1;
+
+  ipa_tid_cleanup:
+    EVP_MD_CTX_free(mdctx);
+    if (!ok)
+      goto fail;
+  }
+
+  if (!derive_ipa_binding_challenge(ctx, ux_scalar, ipa_transcript_id, t_hat))
+    goto fail;
+
+  secp256k1_pubkey P = A;
+
+  /* P += x*S */
+  {
+    secp256k1_pubkey xS = S;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &xS, x))
+    {
+      goto fail;
+    }
+
+    secp256k1_pubkey newP;
+    const secp256k1_pubkey *pts[2] = {&P, &xS};
+    if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts, 2))
+      goto fail;
+    P = newP;
+  }
+
+  /* P += sum_{k=0}^{n-1} [ (-z)*G_k + ( z*y^k + z^(block+2)*z^2*2^i ) *
+   * (y^{-k}*H_k) ] */
+  unsigned char neg_z[kMPT_SCALAR_SIZE];
+  secp256k1_mpt_scalar_negate(neg_z, z);
+
+  for (size_t j = 0; j < m; j++)
+  {
+    unsigned char z_j2[kMPT_SCALAR_SIZE];
+    scalar_pow_u32(ctx, z_j2, z, (unsigned int)(j + 2));
+
+    for (size_t i = 0; i < 64; i++)
+    {
+      const size_t k = j * 64 + i;
+
+      /* ---- Gi term: (-z) * G_k ---- */
+      if (!scalar_is_zero(neg_z))
+      {
+        secp256k1_pubkey Gi = G_vec[k];
+        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &Gi, neg_z))
+          goto fail;
+
+        secp256k1_pubkey newP;
+        const secp256k1_pubkey *pts2[2] = {&P, &Gi};
+        if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts2, 2))
+          goto fail;
+        P = newP;
+      }
+
+      /* ---- Hi term: termH * (y^{-k} * H_k) ---- */
+      unsigned char termH[kMPT_SCALAR_SIZE], tmp[kMPT_SCALAR_SIZE];
+      unsigned char two_i[kMPT_SCALAR_SIZE] = {0};
+
+      secp256k1_mpt_scalar_mul(
+          termH, z, (const unsigned char *)(y_powers + kMPT_SCALAR_SIZE * k));
+
+      two_i[31 - (i / 8)] = (unsigned char)(1u << (i % 8));
+      secp256k1_mpt_scalar_mul(tmp, z_j2, two_i);
+      secp256k1_mpt_scalar_add(termH, termH, tmp);
+
+      if (!scalar_is_zero(termH))
+      {
+        secp256k1_pubkey Hi = H_vec[k];
+
+        /* Hi = (y^{-k} * H_k) */
+        if (!secp256k1_ec_pubkey_tweak_mul(
+                ctx, &Hi,
+                (const unsigned char *)(y_inv_powers + kMPT_SCALAR_SIZE * k)))
+          goto fail;
+
+        /* Hi = termH * Hi */
+        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &Hi, termH))
+          goto fail;
+
+        secp256k1_pubkey newP;
+        const secp256k1_pubkey *pts2[2] = {&P, &Hi};
+        if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts2, 2))
+          goto fail;
+        P = newP;
+      }
+
+      OPENSSL_cleanse(tmp, kMPT_SCALAR_SIZE);
+      OPENSSL_cleanse(termH, kMPT_SCALAR_SIZE);
+    }
+
+    OPENSSL_cleanse(z_j2, kMPT_SCALAR_SIZE);
+  }
+
+  /* P += (t_hat * ux) * U */
+  {
+    unsigned char t_hat_ux[kMPT_SCALAR_SIZE];
+    unsigned char zero32[kMPT_SCALAR_SIZE] = {0};
+    secp256k1_mpt_scalar_mul(t_hat_ux, t_hat, ux_scalar);
+
+    if (memcmp(t_hat_ux, zero32, kMPT_SCALAR_SIZE) != 0)
+    {
+      secp256k1_pubkey Q = U;
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &Q, t_hat_ux))
+      {
+        OPENSSL_cleanse(t_hat_ux, kMPT_SCALAR_SIZE);
+        goto fail;
+      }
+      const secp256k1_pubkey *pts2[2] = {&P, &Q};
+      secp256k1_pubkey newP;
+      if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts2, 2))
+        goto fail;
+      P = newP;
+    }
+    OPENSSL_cleanse(t_hat_ux, kMPT_SCALAR_SIZE);
+  }
+
+  /* P -= mu*h_generator */
+  {
+    unsigned char neg_mu[kMPT_SCALAR_SIZE];
+    secp256k1_mpt_scalar_negate(neg_mu, mu);
+
+    secp256k1_pubkey mu_term = *h_generator;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &mu_term, neg_mu))
+    {
+      OPENSSL_cleanse(neg_mu, kMPT_SCALAR_SIZE);
+      goto fail;
+    }
+    OPENSSL_cleanse(neg_mu, kMPT_SCALAR_SIZE);
+
+    const secp256k1_pubkey *pts2[2] = {&P, &mu_term};
+    secp256k1_pubkey newP;
+    if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts2, 2))
+      goto fail;
+    P = newP;
+  }
+
+  /* Build Hprime = y^{-k} * H_k (length n) */
+  secp256k1_pubkey *Hprime =
+      (secp256k1_pubkey *)malloc(n * sizeof(secp256k1_pubkey));
+  if (!Hprime)
+  {
+    goto fail;
+  }
+
+  for (size_t k = 0; k < n; k++)
+  {
+    Hprime[k] = H_vec[k];
+    if (!secp256k1_ec_pubkey_tweak_mul(
+            ctx, &Hprime[k],
+            (const unsigned char *)(y_inv_powers + kMPT_SCALAR_SIZE * k)))
+    {
+      free(Hprime);
+      goto fail;
+    }
+  }
+  /* IPA verify */
+
+  int ok = ipa_verify_hybrid_v1_fast(
+      ctx, G_vec, Hprime, &U, &P, n, k3,
+      r3 ? L1_vec : NULL,
+      r3 ? L2_vec : NULL,
+      r3 ? R1_vec : NULL,
+      r3 ? R2_vec : NULL,
+      r2 ? L_vec : NULL,
+      r2 ? R_vec : NULL,
+      a_terminal, b_terminal, ux_scalar, ipa_transcript_id);
+
+  free(Hprime);
+  free(y_block_sum);
+  free(y_powers);
+  free(y_inv_powers);
+  free(L1_vec);
+  free(L2_vec);
+  free(R1_vec);
+  free(R2_vec);
+  free(L_vec);
+  free(R_vec);
+  OPENSSL_cleanse(a_terminal, sizeof(a_terminal));
+  OPENSSL_cleanse(b_terminal, sizeof(b_terminal));
+
+  return ok ? 1 : 0;
+
+fail:
+  /* Centralized cleanup. All goto-fail sites land here; pointers that have
+   * not yet been allocated are still NULL, and free(NULL) is a no-op. */
+  free(y_block_sum);
+  free(y_powers);
+  free(y_inv_powers);
+  free(L1_vec);
+  free(L2_vec);
+  free(R1_vec);
+  free(R2_vec);
+  free(L_vec);
+  free(R_vec);
+  OPENSSL_cleanse(a_terminal, sizeof(a_terminal));
+  OPENSSL_cleanse(b_terminal, sizeof(b_terminal));
+  return 0;
+}

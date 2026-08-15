@@ -96,6 +96,12 @@ add_mpt_test(
 )
 
 add_mpt_test(
+    test_bulletproof_agg_hybrid_v1
+    test_bulletproof_agg_hybrid_v1.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)
+
+add_mpt_test(
     test_mpt_utility
     test_mpt_utility.cpp
     DEPENDENCIES mpt-crypto secp256k1::secp256k1 OpenSSL::Crypto
