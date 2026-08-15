@@ -1624,7 +1624,7 @@ cleanup:
  * All group operations avoid explicit construction of the point at infinity,
  * which is not representable via the libsecp256k1 public-key API.
  */
-static int ipa_verify_explicit(
+int ipa_verify_explicit(
     const secp256k1_context *ctx,
     const secp256k1_pubkey *G_vec, /* original G generators (length n) */
     const secp256k1_pubkey *H_vec, /* original H generators (length n) */

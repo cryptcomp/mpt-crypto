@@ -124,3 +124,13 @@ add_mpt_test(
     test_ct_tweak_mul.c
     DEPENDENCIES mpt-crypto secp256k1::secp256k1 OpenSSL::Crypto
 )
+
+# IPA microbenchmark. Build manually; do not register with CTest.
+add_executable(benchmark_ipa_3w benchmark_ipa_3w.c)
+
+target_link_libraries(
+  benchmark_ipa_3w
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)
