@@ -149,3 +149,18 @@ target_link_libraries(
     mpt-crypto
     secp256k1::secp256k1
 )
+
+add_mpt_test(
+    test_ipa_2w_dynamic
+    test_ipa_2w_dynamic.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)
+
+# Dynamic-2W comparison microbenchmark. Build manually; do not register with CTest.
+add_executable(benchmark_ipa_2w_dynamic benchmark_ipa_2w_dynamic.c)
+target_link_libraries(
+  benchmark_ipa_2w_dynamic
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)

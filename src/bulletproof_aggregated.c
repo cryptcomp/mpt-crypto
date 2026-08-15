@@ -1809,6 +1809,459 @@ cleanup:
   return ok;
 }
 
+/* ==========================================================================
+ * Dynamically padded 2-way IPA.
+ *
+ * This is the binary analogue of the dynamic-padding policy used by the 3W
+ * implementation.  At each recursion level:
+ *
+ *   - if cur_n is even, split directly into two equal halves;
+ *   - if cur_n is odd, append exactly one zero coordinate and one
+ *     deterministically derived G/H generator pair, then split.
+ *
+ * Thus the next dimension is always ceil(cur_n / 2), rather than globally
+ * padding the original problem to the next power of two.
+ *
+ * The final dimension is 1.  This experimental path is IPA-only and does not
+ * replace the existing serialized Bulletproof format.
+ * ========================================================================== */
+
+static inline size_t bp_ipa_rounds_2w_dynamic(size_t n)
+{
+  size_t r = 0;
+  while (n > 1)
+  {
+    n = (n + 1) / 2; /* ceil(n/2) */
+    ++r;
+  }
+  return r;
+}
+
+static inline size_t bp_ipa_padded_len_2w(size_t n)
+{
+  return n + (n & 1u);
+}
+
+static void ipa2w_store_u64_be(unsigned char out[8], uint64_t x)
+{
+  for (int i = 7; i >= 0; --i)
+  {
+    out[i] = (unsigned char)(x & 0xffu);
+    x >>= 8;
+  }
+}
+
+/*
+ * Derive the single padding G/H coordinate used by an odd 2W round.
+ *
+ * Domain separation includes:
+ *   - protocol/role tag,
+ *   - original logical n,
+ *   - recursion round.
+ *
+ * Prover and verifier call this function with identical inputs.
+ */
+static int derive_ipa_pad_generators_2w(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *G_pad,
+    secp256k1_pubkey *H_pad,
+    size_t original_n,
+    size_t round)
+{
+  unsigned char label_g[32] = {0};
+  unsigned char label_h[32] = {0};
+
+  static const unsigned char tag_g[] = "IPA2W_DYN_PAD_G";
+  static const unsigned char tag_h[] = "IPA2W_DYN_PAD_H";
+
+  memcpy(label_g, tag_g, sizeof(tag_g) - 1);
+  memcpy(label_h, tag_h, sizeof(tag_h) - 1);
+
+  ipa2w_store_u64_be(label_g + 16, (uint64_t)original_n);
+  ipa2w_store_u64_be(label_h + 16, (uint64_t)original_n);
+  ipa2w_store_u64_be(label_g + 24, (uint64_t)round);
+  ipa2w_store_u64_be(label_h + 24, (uint64_t)round);
+
+  if (!secp256k1_mpt_get_generator_vector(ctx, G_pad, 1, label_g, sizeof(label_g)))
+    return 0;
+  if (!secp256k1_mpt_get_generator_vector(ctx, H_pad, 1, label_h, sizeof(label_h)))
+    return 0;
+
+  return 1;
+}
+
+/* Apply one standard binary IPA verifier update:
+ *
+ *   P <- P + x^2 L + x^{-2} R
+ */
+static int apply_ipa_folding_to_P_2w_one(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *P,
+    const secp256k1_pubkey *L,
+    const secp256k1_pubkey *R,
+    const unsigned char x[kMPT_SCALAR_SIZE],
+    const unsigned char x_inv[kMPT_SCALAR_SIZE])
+{
+  unsigned char x_sq[kMPT_SCALAR_SIZE];
+  unsigned char xinv_sq[kMPT_SCALAR_SIZE];
+  secp256k1_pubkey tL = *L, tR = *R, newP;
+  const secp256k1_pubkey *pts[3];
+
+  secp256k1_mpt_scalar_mul(x_sq, x, x);
+  secp256k1_mpt_scalar_mul(xinv_sq, x_inv, x_inv);
+
+  if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tL, x_sq))
+    goto fail;
+  if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tR, xinv_sq))
+    goto fail;
+
+  pts[0] = P;
+  pts[1] = &tL;
+  pts[2] = &tR;
+  if (!secp256k1_ec_pubkey_combine(ctx, &newP, pts, 3))
+    goto fail;
+
+  *P = newP;
+  OPENSSL_cleanse(x_sq, sizeof(x_sq));
+  OPENSSL_cleanse(xinv_sq, sizeof(xinv_sq));
+  return 1;
+
+fail:
+  OPENSSL_cleanse(x_sq, sizeof(x_sq));
+  OPENSSL_cleanse(xinv_sq, sizeof(xinv_sq));
+  return 0;
+}
+
+/* Fold only G/H for a binary verifier round.
+ *
+ *   G'[i] = G_L[i] * x^{-1} + G_R[i] * x
+ *   H'[i] = H_L[i] * x      + H_R[i] * x^{-1}
+ */
+static int fold_generators_step_2w(
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *G,
+    secp256k1_pubkey *H,
+    size_t half_n,
+    const unsigned char x[kMPT_SCALAR_SIZE],
+    const unsigned char x_inv[kMPT_SCALAR_SIZE])
+{
+  for (size_t i = 0; i < half_n; ++i)
+  {
+    secp256k1_pubkey left, right;
+    const secp256k1_pubkey *pts[2];
+
+    left = G[i];
+    right = G[i + half_n];
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &left, x_inv))
+      return 0;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &right, x))
+      return 0;
+    pts[0] = &left;
+    pts[1] = &right;
+    if (!secp256k1_ec_pubkey_combine(ctx, &G[i], pts, 2))
+      return 0;
+
+    left = H[i];
+    right = H[i + half_n];
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &left, x))
+      return 0;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &right, x_inv))
+      return 0;
+    pts[0] = &left;
+    pts[1] = &right;
+    if (!secp256k1_ec_pubkey_combine(ctx, &H[i], pts, 2))
+      return 0;
+  }
+
+  return 1;
+}
+
+/*
+ * Binary IPA prover with local/dynamic padding.
+ *
+ * Unlike secp256k1_bulletproof_run_ipa_prover(), this function accepts any
+ * logical n >= 1 and does not mutate caller-owned vectors.
+ */
+int secp256k1_bulletproof_run_ipa_prover_2w_dynamic(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const unsigned char *a_vec,
+    const unsigned char *b_vec,
+    size_t n,
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE],
+    const unsigned char ux_scalar[kMPT_SCALAR_SIZE],
+    secp256k1_pubkey *L_out,
+    secp256k1_pubkey *R_out,
+    size_t max_rounds,
+    size_t *rounds_out,
+    unsigned char a_final[kMPT_SCALAR_SIZE],
+    unsigned char b_final[kMPT_SCALAR_SIZE])
+{
+  const size_t rounds = bp_ipa_rounds_2w_dynamic(n);
+  const size_t capacity = n + 1;
+
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  unsigned char *aw = NULL, *bw = NULL;
+
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+
+  size_t cur_n = n;
+  int ok = 0;
+
+  if (!ctx || !U || !G_vec || !H_vec || !a_vec || !b_vec ||
+      !ipa_transcript_id || !ux_scalar || !a_final || !b_final ||
+      n == 0 || rounds > max_rounds)
+    return 0;
+
+  if (rounds > 0 && (!L_out || !R_out))
+    return 0;
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  aw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+  bw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+
+  if (!Gw || !Hw || !aw || !bw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(Hw, H_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(aw, a_vec, n * kMPT_SCALAR_SIZE);
+  memcpy(bw, b_vec, n * kMPT_SCALAR_SIZE);
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+
+  for (size_t r = 0; r < rounds; ++r)
+  {
+    const size_t padded_n = bp_ipa_padded_len_2w(cur_n);
+    const size_t half_n = padded_n / 2;
+
+    if (cur_n <= 1 || padded_n > capacity)
+      goto cleanup;
+
+    if (padded_n != cur_n)
+    {
+      memset(aw + cur_n * kMPT_SCALAR_SIZE, 0, kMPT_SCALAR_SIZE);
+      memset(bw + cur_n * kMPT_SCALAR_SIZE, 0, kMPT_SCALAR_SIZE);
+
+      if (!derive_ipa_pad_generators_2w(
+              ctx, &Gw[cur_n], &Hw[cur_n], n, r))
+        goto cleanup;
+    }
+
+    if (!secp256k1_bulletproof_ipa_compute_LR(
+            ctx, &L_out[r], &R_out[r],
+            aw, aw + half_n * kMPT_SCALAR_SIZE,
+            bw, bw + half_n * kMPT_SCALAR_SIZE,
+            Gw, Gw + half_n,
+            Hw, Hw + half_n,
+            U, ux_scalar, half_n))
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge(
+            ctx, x, last, &L_out[r], &R_out[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!secp256k1_bulletproof_ipa_compress_step(
+            ctx, aw, bw, Gw, Hw, half_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = half_n;
+  }
+
+  if (cur_n != 1)
+    goto cleanup;
+
+  memcpy(a_final, aw, kMPT_SCALAR_SIZE);
+  memcpy(b_final, bw, kMPT_SCALAR_SIZE);
+
+  if (rounds_out)
+    *rounds_out = rounds;
+
+  ok = 1;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+
+  if (aw)
+    OPENSSL_cleanse(aw, capacity * kMPT_SCALAR_SIZE);
+  if (bw)
+    OPENSSL_cleanse(bw, capacity * kMPT_SCALAR_SIZE);
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(secp256k1_pubkey));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(secp256k1_pubkey));
+
+  free(aw);
+  free(bw);
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
+/*
+ * Explicit verifier for dynamically padded binary IPA.
+ *
+ * Generator folding is deliberately performed round-by-round so that the
+ * implementation follows the same dynamic dimensions as the prover.
+ */
+int ipa_verify_explicit_2w_dynamic(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L_vec,
+    const secp256k1_pubkey *R_vec,
+    size_t n,
+    const unsigned char a_final[kMPT_SCALAR_SIZE],
+    const unsigned char b_final[kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  const size_t rounds = bp_ipa_rounds_2w_dynamic(n);
+  const size_t capacity = n + 1;
+
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  secp256k1_pubkey P, RHS, tmp;
+
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+
+  size_t cur_n = n;
+  int RHS_inited = 0;
+  int ok = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_final || !b_final || !ux || !ipa_transcript_id || n == 0)
+    return 0;
+
+  if (rounds > 0 && (!L_vec || !R_vec))
+    return 0;
+
+  if (!scalar_is_canonical_3w(a_final) ||
+      !scalar_is_canonical_3w(b_final))
+    return 0;
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  if (!Gw || !Hw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(Hw, H_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+  P = *P_in;
+
+  for (size_t r = 0; r < rounds; ++r)
+  {
+    const size_t padded_n = bp_ipa_padded_len_2w(cur_n);
+    const size_t half_n = padded_n / 2;
+
+    if (cur_n <= 1 || padded_n > capacity)
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge(
+            ctx, x, last, &L_vec[r], &R_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_2w_one(
+            ctx, &P, &L_vec[r], &R_vec[r], x, x_inv))
+      goto cleanup;
+
+    if (padded_n != cur_n)
+    {
+      if (!derive_ipa_pad_generators_2w(
+              ctx, &Gw[cur_n], &Hw[cur_n], n, r))
+        goto cleanup;
+    }
+
+    if (!fold_generators_step_2w(
+            ctx, Gw, Hw, half_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = half_n;
+  }
+
+  if (cur_n != 1)
+    goto cleanup;
+
+  /* RHS = a*Gf + b*Hf + (a*b*ux)*U */
+  if (!scalar_is_zero(a_final))
+  {
+    tmp = Gw[0];
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, a_final) ||
+        !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      goto cleanup;
+  }
+
+  if (!scalar_is_zero(b_final))
+  {
+    tmp = Hw[0];
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, b_final) ||
+        !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      goto cleanup;
+  }
+
+  {
+    unsigned char ab[kMPT_SCALAR_SIZE];
+    unsigned char abux[kMPT_SCALAR_SIZE];
+
+    secp256k1_mpt_scalar_mul(ab, a_final, b_final);
+    secp256k1_mpt_scalar_mul(abux, ab, ux);
+
+    if (!scalar_is_zero(abux))
+    {
+      tmp = *U;
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, abux) ||
+          !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      {
+        OPENSSL_cleanse(ab, sizeof(ab));
+        OPENSSL_cleanse(abux, sizeof(abux));
+        goto cleanup;
+      }
+    }
+
+    OPENSSL_cleanse(ab, sizeof(ab));
+    OPENSSL_cleanse(abux, sizeof(abux));
+  }
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(secp256k1_pubkey));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(secp256k1_pubkey));
+
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
 /**
  * Runs the Inner Product Argument (IPA) prover.
  * Recursively folds vectors G, H, a, and b into a single final term,
