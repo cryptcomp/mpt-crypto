@@ -206,3 +206,12 @@ add_mpt_test(
     test_ipa_hybrid_v1_fast.c
     DEPENDENCIES mpt-crypto secp256k1::secp256k1
 )
+
+# Hybrid-v1 schedule/Pareto benchmark. Build manually; not a CTest.
+add_executable(benchmark_ipa_hybrid_v1 benchmark_ipa_hybrid_v1.c)
+target_link_libraries(
+  benchmark_ipa_hybrid_v1
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)
