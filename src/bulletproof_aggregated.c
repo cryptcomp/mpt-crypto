@@ -1288,7 +1288,7 @@ cleanup:
 /* Pure 3W prover.  Inputs are copied because dynamic padding requires up to
  * two extra slots in the first round and the caller's original vectors should
  * remain unchanged. */
-static int secp256k1_bulletproof_run_ipa_prover_3w(
+int secp256k1_bulletproof_run_ipa_prover_3w(
     const secp256k1_context *ctx, const secp256k1_pubkey *U,
     const secp256k1_pubkey *G_vec, const secp256k1_pubkey *H_vec,
     const unsigned char *a_vec, const unsigned char *b_vec, size_t n,
@@ -1393,7 +1393,7 @@ cleanup:
 /* Explicit verifier for pure 3W.  This intentionally performs the generator
  * folds round-by-round.  It is the simplest correctness baseline; a later
  * optimization can collapse the verification into one MSM. */
-static int ipa_verify_explicit_3w(
+int ipa_verify_explicit_3w(
     const secp256k1_context *ctx, const secp256k1_pubkey *G_vec,
     const secp256k1_pubkey *H_vec, const secp256k1_pubkey *U,
     const secp256k1_pubkey *P_in, const secp256k1_pubkey *L1_vec,

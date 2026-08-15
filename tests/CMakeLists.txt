@@ -87,6 +87,7 @@ add_mpt_test(
 )
 
 add_mpt_test(test_ipa test_ipa.c DEPENDENCIES mpt-crypto secp256k1::secp256k1)
+add_mpt_test(test_ipa_3w test_ipa_3w.c DEPENDENCIES mpt-crypto secp256k1::secp256k1)
 
 add_mpt_test(
     test_bulletproof_agg
