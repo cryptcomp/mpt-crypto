@@ -164,3 +164,18 @@ target_link_libraries(
     mpt-crypto
     secp256k1::secp256k1
 )
+
+add_mpt_test(
+    test_ipa_2w_dynamic_fast
+    test_ipa_2w_dynamic_fast.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)
+
+# Optimized dynamic-2W verifier benchmark. Build manually; do not register with CTest.
+add_executable(benchmark_ipa_2w_dynamic_fast benchmark_ipa_2w_dynamic_fast.c)
+target_link_libraries(
+  benchmark_ipa_2w_dynamic_fast
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)

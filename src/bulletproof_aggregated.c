@@ -2262,6 +2262,380 @@ cleanup:
   return ok;
 }
 
+/* ==========================================================================
+ * Optimized verifier for dynamically padded 2-way IPA.
+ *
+ * The baseline dynamic verifier explicitly folds every G/H point at every
+ * recursion level.  This verifier instead:
+ *
+ *   1. re-derives all Fiat-Shamir challenges;
+ *   2. computes, in the scalar field, the final coefficient of every original
+ *      generator and every dynamically introduced padding generator;
+ *   3. evaluates G_f and H_f with one MSM each;
+ *   4. applies the usual L/R updates to P and performs the final IPA check.
+ *
+ * For an exact power-of-two input no dynamic padding occurs, so the proof is
+ * byte-for-byte the standard binary IPA proof.  In that case we deliberately
+ * dispatch to ipa_verify_explicit(), giving the optimized standard verifier as
+ * the exact fast path and making the power-of-two control comparison clean.
+ * ========================================================================== */
+
+static inline int bp_is_power_of_two_2w_fast(size_t n)
+{
+  return n != 0 && (n & (n - 1)) == 0;
+}
+
+/*
+ * Compute the coefficient with which one leaf generator contributes to the
+ * final folded generator.
+ *
+ * A leaf may be:
+ *   - an original generator, born at round 0 with index i, or
+ *   - a dynamic pad generator, born at an odd round r at index cur_n[r].
+ *
+ * G folding:
+ *   left  -> x^{-1}
+ *   right -> x
+ *
+ * H folding:
+ *   left  -> x
+ *   right -> x^{-1}
+ */
+static void ipa2w_dynamic_leaf_coefficients(
+    unsigned char g_coeff[kMPT_SCALAR_SIZE],
+    unsigned char h_coeff[kMPT_SCALAR_SIZE],
+    size_t start_index,
+    size_t start_round,
+    const size_t *dims,
+    const unsigned char *u_flat,
+    const unsigned char *uinv_flat,
+    size_t rounds)
+{
+  size_t idx = start_index;
+
+  memset(g_coeff, 0, kMPT_SCALAR_SIZE);
+  memset(h_coeff, 0, kMPT_SCALAR_SIZE);
+  g_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+  h_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+
+  for (size_t r = start_round; r < rounds; ++r)
+  {
+    const size_t half_n = (dims[r] + 1) / 2;
+    const int is_right = idx >= half_n;
+
+    const unsigned char *x =
+        u_flat + r * kMPT_SCALAR_SIZE;
+    const unsigned char *x_inv =
+        uinv_flat + r * kMPT_SCALAR_SIZE;
+
+    if (!is_right)
+    {
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x_inv);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x);
+    }
+    else
+    {
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x_inv);
+      idx -= half_n;
+    }
+  }
+}
+
+int ipa_verify_explicit(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L_vec,
+    const secp256k1_pubkey *R_vec,
+    size_t n,
+    const unsigned char a_final[kMPT_SCALAR_SIZE],
+    const unsigned char b_final[kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE]);
+
+
+/*
+ * Optimized explicit verifier for binary IPA with local/dynamic padding.
+ *
+ * The accepted proof format is identical to ipa_verify_explicit_2w_dynamic().
+ * Only the verifier implementation changes.
+ */
+int ipa_verify_explicit_2w_dynamic_fast(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L_vec,
+    const secp256k1_pubkey *R_vec,
+    size_t n,
+    const unsigned char a_final[kMPT_SCALAR_SIZE],
+    const unsigned char b_final[kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  const size_t rounds = bp_ipa_rounds_2w_dynamic(n);
+
+  unsigned char *u_flat = NULL;
+  unsigned char *uinv_flat = NULL;
+  size_t *dims = NULL;
+
+  secp256k1_pubkey *G_points = NULL;
+  secp256k1_pubkey *H_points = NULL;
+  unsigned char *G_scalars = NULL;
+  unsigned char *H_scalars = NULL;
+
+  secp256k1_pubkey P, Gf, Hf, RHS, tmp;
+  int RHS_inited = 0;
+  int ok = 0;
+
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  size_t pad_count = 0;
+  size_t total_points = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_final || !b_final || !ux || !ipa_transcript_id || n == 0)
+    return 0;
+
+  if (rounds > 0 && (!L_vec || !R_vec))
+    return 0;
+
+  if (!scalar_is_canonical_3w(a_final) ||
+      !scalar_is_canonical_3w(b_final))
+    return 0;
+
+  /*
+   * At powers of two the dynamic prover performs no padding at any level and
+   * therefore generates the ordinary binary IPA proof.  Reuse the existing
+   * optimized verifier exactly.
+   */
+  if (n > 1 && bp_is_power_of_two_2w_fast(n))
+  {
+    return ipa_verify_explicit(
+        ctx, G_vec, H_vec, U, P_in, L_vec, R_vec, n,
+        a_final, b_final, ux, ipa_transcript_id);
+  }
+
+  if (rounds > 0)
+  {
+    u_flat =
+        (unsigned char *)malloc(rounds * kMPT_SCALAR_SIZE);
+    uinv_flat =
+        (unsigned char *)malloc(rounds * kMPT_SCALAR_SIZE);
+    dims = (size_t *)malloc(rounds * sizeof(size_t));
+
+    if (!u_flat || !uinv_flat || !dims)
+      goto cleanup;
+  }
+
+  /*
+   * Record the logical dimension entering every round and count how many
+   * independent pad-generator pairs are introduced.
+   */
+  {
+    size_t cur_n = n;
+    for (size_t r = 0; r < rounds; ++r)
+    {
+      dims[r] = cur_n;
+      if (cur_n & 1u)
+        ++pad_count;
+      cur_n = (cur_n + 1) / 2;
+    }
+
+    if (cur_n != 1)
+      goto cleanup;
+  }
+
+  /*
+   * Re-derive all challenges exactly as the prover and the baseline verifier
+   * do.  The transcript itself is unchanged by this optimization.
+   */
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+
+  for (size_t r = 0; r < rounds; ++r)
+  {
+    unsigned char *x =
+        u_flat + r * kMPT_SCALAR_SIZE;
+    unsigned char *x_inv =
+        uinv_flat + r * kMPT_SCALAR_SIZE;
+
+    if (!derive_ipa_round_challenge(
+            ctx, x, last, &L_vec[r], &R_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+  }
+
+  total_points = n + pad_count;
+
+  G_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(secp256k1_pubkey));
+  H_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(secp256k1_pubkey));
+  G_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+  H_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+
+  if (!G_points || !H_points || !G_scalars || !H_scalars)
+    goto cleanup;
+
+  /*
+   * Original generator leaves.
+   *
+   * Their indices start at the original IPA dimension and are followed through
+   * the changing sequence
+   *
+   *   n -> ceil(n/2) -> ceil(n/4) -> ...
+   *
+   * using only scalar arithmetic.
+   */
+  for (size_t i = 0; i < n; ++i)
+  {
+    G_points[i] = G_vec[i];
+    H_points[i] = H_vec[i];
+
+    ipa2w_dynamic_leaf_coefficients(
+        G_scalars + i * kMPT_SCALAR_SIZE,
+        H_scalars + i * kMPT_SCALAR_SIZE,
+        i, 0, dims, u_flat, uinv_flat, rounds);
+  }
+
+  /*
+   * Padding leaves.
+   *
+   * If dims[r] is odd, the prover appends one new generator at index dims[r]
+   * immediately before round r.  That leaf participates starting at r, not in
+   * earlier rounds.
+   */
+  {
+    size_t out = n;
+
+    for (size_t r = 0; r < rounds; ++r)
+    {
+      if ((dims[r] & 1u) == 0)
+        continue;
+
+      if (!derive_ipa_pad_generators_2w(
+              ctx, &G_points[out], &H_points[out], n, r))
+        goto cleanup;
+
+      ipa2w_dynamic_leaf_coefficients(
+          G_scalars + out * kMPT_SCALAR_SIZE,
+          H_scalars + out * kMPT_SCALAR_SIZE,
+          dims[r], r, dims, u_flat, uinv_flat, rounds);
+
+      ++out;
+    }
+
+    if (out != total_points)
+      goto cleanup;
+  }
+
+  /*
+   * Reconstruct the two final folded generators with one MSM each instead of
+   * repeatedly folding all points at every recursion level.
+   */
+  if (!secp256k1_bulletproof_ipa_msm(
+          ctx, &Gf, G_points, G_scalars, total_points))
+    goto cleanup;
+
+  if (!secp256k1_bulletproof_ipa_msm(
+          ctx, &Hf, H_points, H_scalars, total_points))
+    goto cleanup;
+
+  /* RHS = a*Gf + b*Hf + (a*b*ux)*U */
+  if (!scalar_is_zero(a_final))
+  {
+    tmp = Gf;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, a_final) ||
+        !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      goto cleanup;
+  }
+
+  if (!scalar_is_zero(b_final))
+  {
+    tmp = Hf;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, b_final) ||
+        !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      goto cleanup;
+  }
+
+  {
+    unsigned char ab[kMPT_SCALAR_SIZE];
+    unsigned char abux[kMPT_SCALAR_SIZE];
+
+    secp256k1_mpt_scalar_mul(ab, a_final, b_final);
+    secp256k1_mpt_scalar_mul(abux, ab, ux);
+
+    if (!scalar_is_zero(abux))
+    {
+      tmp = *U;
+      if (!secp256k1_ec_pubkey_tweak_mul(ctx, &tmp, abux) ||
+          !add_term(ctx, &RHS, &RHS_inited, &tmp))
+      {
+        OPENSSL_cleanse(ab, sizeof(ab));
+        OPENSSL_cleanse(abux, sizeof(abux));
+        goto cleanup;
+      }
+    }
+
+    OPENSSL_cleanse(ab, sizeof(ab));
+    OPENSSL_cleanse(abux, sizeof(abux));
+  }
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  /*
+   * The P-side recursion is already cheap: two public point scalings per round.
+   * Reuse the existing verifier helper.
+   */
+  P = *P_in;
+
+  if (rounds > 0 &&
+      !apply_ipa_folding_to_P(
+          ctx, &P, L_vec, R_vec, u_flat, uinv_flat, rounds))
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(last, sizeof(last));
+
+  if (u_flat)
+    OPENSSL_cleanse(u_flat, rounds * kMPT_SCALAR_SIZE);
+  if (uinv_flat)
+    OPENSSL_cleanse(uinv_flat, rounds * kMPT_SCALAR_SIZE);
+  if (G_scalars)
+    OPENSSL_cleanse(G_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (H_scalars)
+    OPENSSL_cleanse(H_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (dims)
+    OPENSSL_cleanse(dims, rounds * sizeof(size_t));
+  if (G_points)
+    OPENSSL_cleanse(G_points, total_points * sizeof(secp256k1_pubkey));
+  if (H_points)
+    OPENSSL_cleanse(H_points, total_points * sizeof(secp256k1_pubkey));
+
+  free(u_flat);
+  free(uinv_flat);
+  free(dims);
+  free(G_points);
+  free(H_points);
+  free(G_scalars);
+  free(H_scalars);
+
+  return ok;
+}
+
 /**
  * Runs the Inner Product Argument (IPA) prover.
  * Recursively folds vectors G, H, a, and b into a single final term,
