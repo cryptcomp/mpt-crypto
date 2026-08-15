@@ -1810,6 +1810,456 @@ cleanup:
 }
 
 /* ==========================================================================
+ * Optimized 3-way IPA verifiers (pure 3W and 3W + early termination).
+ *
+ * These functions verify exactly the same proofs as the explicit 3W verifiers.
+ * The protocol, padding rule, Fiat-Shamir transcript, and proof bytes are
+ * unchanged.  Only the verifier's generator reconstruction is optimized.
+ *
+ * Instead of physically folding all G/H generators round-by-round, we:
+ *
+ *   1. re-derive all 3W challenges x_r;
+ *   2. determine the final coefficient and terminal slot of every original
+ *      generator and every dynamically introduced padding generator;
+ *   3. multiply those folding coefficients by the appropriate terminal
+ *      a_j / b_j scalar;
+ *   4. evaluate the complete G side with one MSM and the complete H side with
+ *      one MSM;
+ *   5. apply the ordinary P-side L1/L2/R1/R2 updates and compare.
+ *
+ * For one 3W round:
+ *
+ *   G' = x^{-1} G1 + G2 + x G3
+ *   H' = x H1      + H2 + x^{-1} H3
+ *
+ * Hence a leaf in block 0/1/2 receives:
+ *
+ *   G factor: x^{-1}, 1, x
+ *   H factor: x,      1, x^{-1}
+ *
+ * A dynamic pad generator begins participating only in the round in which it
+ * is introduced.
+ * ========================================================================== */
+
+static void ipa3w_leaf_coefficients_and_slot(
+    unsigned char g_coeff[kMPT_SCALAR_SIZE],
+    unsigned char h_coeff[kMPT_SCALAR_SIZE],
+    size_t *terminal_slot_out,
+    size_t start_index,
+    size_t start_round,
+    const size_t *dims,
+    const unsigned char *x_flat,
+    const unsigned char *xinv_flat,
+    size_t rounds)
+{
+  size_t idx = start_index;
+
+  memset(g_coeff, 0, kMPT_SCALAR_SIZE);
+  memset(h_coeff, 0, kMPT_SCALAR_SIZE);
+  g_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+  h_coeff[kMPT_SCALAR_SIZE - 1] = 1;
+
+  for (size_t r = start_round; r < rounds; ++r)
+  {
+    const size_t third_n = (dims[r] + 2) / 3;
+    const size_t block = idx / third_n;
+    const unsigned char *x = x_flat + r * kMPT_SCALAR_SIZE;
+    const unsigned char *x_inv = xinv_flat + r * kMPT_SCALAR_SIZE;
+
+    if (block == 0)
+    {
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x_inv);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x);
+    }
+    else if (block == 1)
+    {
+      /* Middle block has coefficient 1 for both G and H. */
+    }
+    else if (block == 2)
+    {
+      secp256k1_mpt_scalar_mul(g_coeff, g_coeff, x);
+      secp256k1_mpt_scalar_mul(h_coeff, h_coeff, x_inv);
+    }
+    else
+    {
+      /*
+       * This should be unreachable for a correctly padded 3W dimension.
+       * Mark the output slot invalid so the caller rejects the proof.
+       */
+      *terminal_slot_out = (size_t)-1;
+      return;
+    }
+
+    idx %= third_n;
+  }
+
+  *terminal_slot_out = idx;
+}
+
+static int ipa_verify_explicit_3w_fast_core(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L1_vec,
+    const secp256k1_pubkey *L2_vec,
+    const secp256k1_pubkey *R1_vec,
+    const secp256k1_pubkey *R2_vec,
+    size_t n,
+    size_t rounds,
+    size_t expected_terminal_n,
+    const unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  unsigned char *x_flat = NULL;
+  unsigned char *xinv_flat = NULL;
+  size_t *dims = NULL;
+
+  secp256k1_pubkey *G_points = NULL;
+  secp256k1_pubkey *H_points = NULL;
+  unsigned char *G_scalars = NULL;
+  unsigned char *H_scalars = NULL;
+
+  secp256k1_pubkey P, RHS;
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  unsigned char dot[kMPT_SCALAR_SIZE] = {0};
+
+  size_t pad_count = 0;
+  size_t total_points = 0;
+  int RHS_inited = 0;
+  int ok = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_terminal || !b_terminal || !ux || !ipa_transcript_id ||
+      n == 0 || expected_terminal_n == 0 || expected_terminal_n > 3)
+    return 0;
+
+  if (rounds > 0 &&
+      (!L1_vec || !L2_vec || !R1_vec || !R2_vec))
+    return 0;
+
+  /* Match the slow ET verifier's canonicality and fixed-slot checks. */
+  for (size_t i = 0; i < expected_terminal_n; ++i)
+  {
+    if (!scalar_is_canonical_3w(
+            a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_canonical_3w(
+            b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  for (size_t i = expected_terminal_n; i < 3; ++i)
+  {
+    if (!scalar_is_zero(a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_zero(b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  if (rounds > 0)
+  {
+    x_flat =
+        (unsigned char *)malloc(rounds * kMPT_SCALAR_SIZE);
+    xinv_flat =
+        (unsigned char *)malloc(rounds * kMPT_SCALAR_SIZE);
+    dims = (size_t *)malloc(rounds * sizeof(size_t));
+
+    if (!x_flat || !xinv_flat || !dims)
+      goto cleanup;
+  }
+
+  /*
+   * Record the logical dimension entering every round and count the number of
+   * independently derived pad-generator pairs.
+   */
+  {
+    size_t cur_n = n;
+
+    for (size_t r = 0; r < rounds; ++r)
+    {
+      const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+      const size_t pad = padded_n - cur_n;
+
+      dims[r] = cur_n;
+      pad_count += pad;
+      cur_n = padded_n / 3;
+    }
+
+    if (cur_n != expected_terminal_n)
+      goto cleanup;
+  }
+
+  /*
+   * Re-derive the transcript challenges and update P exactly as the baseline
+   * verifier does.  The P-side work is only four public point scalings per
+   * round, so the optimization targets the much larger G/H recursion.
+   */
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+  P = *P_in;
+
+  for (size_t r = 0; r < rounds; ++r)
+  {
+    unsigned char *x = x_flat + r * kMPT_SCALAR_SIZE;
+    unsigned char *x_inv = xinv_flat + r * kMPT_SCALAR_SIZE;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x, last, &L1_vec[r], &L2_vec[r],
+            &R1_vec[r], &R2_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_3w(
+            ctx, &P, &L1_vec[r], &L2_vec[r],
+            &R1_vec[r], &R2_vec[r], x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+  }
+
+  total_points = n + pad_count;
+
+  G_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(secp256k1_pubkey));
+  H_points =
+      (secp256k1_pubkey *)malloc(total_points * sizeof(secp256k1_pubkey));
+  G_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+  H_scalars =
+      (unsigned char *)malloc(total_points * kMPT_SCALAR_SIZE);
+
+  if (!G_points || !H_points || !G_scalars || !H_scalars)
+    goto cleanup;
+
+  /*
+   * Original leaves.
+   *
+   * We directly compute each leaf's contribution to the final terminal
+   * relation.  If a leaf ends in terminal slot j:
+   *
+   *   G scalar = folding_coefficient_G * a_terminal[j]
+   *   H scalar = folding_coefficient_H * b_terminal[j]
+   *
+   * This lets us evaluate all terminal G vectors with one MSM and all terminal
+   * H vectors with one MSM, even when ET stops at dimension 2 or 3.
+   */
+  for (size_t i = 0; i < n; ++i)
+  {
+    unsigned char g_fold[kMPT_SCALAR_SIZE];
+    unsigned char h_fold[kMPT_SCALAR_SIZE];
+    size_t slot = 0;
+
+    G_points[i] = G_vec[i];
+    H_points[i] = H_vec[i];
+
+    ipa3w_leaf_coefficients_and_slot(
+        g_fold, h_fold, &slot,
+        i, 0, dims, x_flat, xinv_flat, rounds);
+
+    if (slot >= expected_terminal_n)
+    {
+      OPENSSL_cleanse(g_fold, sizeof(g_fold));
+      OPENSSL_cleanse(h_fold, sizeof(h_fold));
+      goto cleanup;
+    }
+
+    secp256k1_mpt_scalar_mul(
+        G_scalars + i * kMPT_SCALAR_SIZE,
+        g_fold,
+        a_terminal + slot * kMPT_SCALAR_SIZE);
+
+    secp256k1_mpt_scalar_mul(
+        H_scalars + i * kMPT_SCALAR_SIZE,
+        h_fold,
+        b_terminal + slot * kMPT_SCALAR_SIZE);
+
+    OPENSSL_cleanse(g_fold, sizeof(g_fold));
+    OPENSSL_cleanse(h_fold, sizeof(h_fold));
+  }
+
+  /*
+   * Dynamic padding leaves.
+   *
+   * At round r, padding points occupy indices dims[r], dims[r]+1 (as needed)
+   * in the freshly padded vector.  They begin accumulating fold factors at
+   * round r and do not participate in any prior challenge.
+   */
+  {
+    size_t out = n;
+
+    for (size_t r = 0; r < rounds; ++r)
+    {
+      const size_t padded_n = bp_ipa_padded_len_3w(dims[r]);
+      const size_t pad = padded_n - dims[r];
+
+      if (pad == 0)
+        continue;
+
+      if (!derive_ipa_pad_generators_3w(
+              ctx, G_points + out, H_points + out,
+              pad, n, r))
+        goto cleanup;
+
+      for (size_t k = 0; k < pad; ++k)
+      {
+        unsigned char g_fold[kMPT_SCALAR_SIZE];
+        unsigned char h_fold[kMPT_SCALAR_SIZE];
+        size_t slot = 0;
+
+        ipa3w_leaf_coefficients_and_slot(
+            g_fold, h_fold, &slot,
+            dims[r] + k, r,
+            dims, x_flat, xinv_flat, rounds);
+
+        if (slot >= expected_terminal_n)
+        {
+          OPENSSL_cleanse(g_fold, sizeof(g_fold));
+          OPENSSL_cleanse(h_fold, sizeof(h_fold));
+          goto cleanup;
+        }
+
+        secp256k1_mpt_scalar_mul(
+            G_scalars + out * kMPT_SCALAR_SIZE,
+            g_fold,
+            a_terminal + slot * kMPT_SCALAR_SIZE);
+
+        secp256k1_mpt_scalar_mul(
+            H_scalars + out * kMPT_SCALAR_SIZE,
+            h_fold,
+            b_terminal + slot * kMPT_SCALAR_SIZE);
+
+        OPENSSL_cleanse(g_fold, sizeof(g_fold));
+        OPENSSL_cleanse(h_fold, sizeof(h_fold));
+        ++out;
+      }
+    }
+
+    if (out != total_points)
+      goto cleanup;
+  }
+
+  /* Complete G and H sides with one MSM each. */
+  if (!msm_try_add(
+          ctx, &RHS, &RHS_inited,
+          G_points, G_scalars, total_points))
+    goto cleanup;
+
+  if (!msm_try_add(
+          ctx, &RHS, &RHS_inited,
+          H_points, H_scalars, total_points))
+    goto cleanup;
+
+  /* Add ux * <a_terminal,b_terminal> * U. */
+  if (!secp256k1_bulletproof_ipa_dot(
+          ctx, dot, a_terminal, b_terminal, expected_terminal_n))
+    goto cleanup;
+
+  if (!add_scaled_U_term_3w(
+          ctx, &RHS, &RHS_inited, U, dot, ux))
+    goto cleanup;
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(last, sizeof(last));
+  OPENSSL_cleanse(dot, sizeof(dot));
+
+  if (x_flat)
+    OPENSSL_cleanse(x_flat, rounds * kMPT_SCALAR_SIZE);
+  if (xinv_flat)
+    OPENSSL_cleanse(xinv_flat, rounds * kMPT_SCALAR_SIZE);
+  if (dims)
+    OPENSSL_cleanse(dims, rounds * sizeof(size_t));
+  if (G_scalars)
+    OPENSSL_cleanse(G_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (H_scalars)
+    OPENSSL_cleanse(H_scalars, total_points * kMPT_SCALAR_SIZE);
+  if (G_points)
+    OPENSSL_cleanse(
+        G_points, total_points * sizeof(secp256k1_pubkey));
+  if (H_points)
+    OPENSSL_cleanse(
+        H_points, total_points * sizeof(secp256k1_pubkey));
+
+  free(x_flat);
+  free(xinv_flat);
+  free(dims);
+  free(G_points);
+  free(H_points);
+  free(G_scalars);
+  free(H_scalars);
+
+  return ok;
+}
+
+/* Optimized verifier for the ordinary pure-3W proof (terminal dimension 1). */
+int ipa_verify_explicit_3w_fast(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L1_vec,
+    const secp256k1_pubkey *L2_vec,
+    const secp256k1_pubkey *R1_vec,
+    const secp256k1_pubkey *R2_vec,
+    size_t n,
+    const unsigned char a_final[kMPT_SCALAR_SIZE],
+    const unsigned char b_final[kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  unsigned char a_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+  unsigned char b_terminal[3 * kMPT_SCALAR_SIZE] = {0};
+
+  if (!a_final || !b_final)
+    return 0;
+
+  memcpy(a_terminal, a_final, kMPT_SCALAR_SIZE);
+  memcpy(b_terminal, b_final, kMPT_SCALAR_SIZE);
+
+  return ipa_verify_explicit_3w_fast_core(
+      ctx, G_vec, H_vec, U, P_in,
+      L1_vec, L2_vec, R1_vec, R2_vec,
+      n, bp_ipa_rounds_3w(n), 1,
+      a_terminal, b_terminal, ux, ipa_transcript_id);
+}
+
+/* Optimized verifier for 3W with early termination at dimension <= 3. */
+int ipa_verify_explicit_3w_et_fast(
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec,
+    const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in,
+    const secp256k1_pubkey *L1_vec,
+    const secp256k1_pubkey *L2_vec,
+    const secp256k1_pubkey *R1_vec,
+    const secp256k1_pubkey *R2_vec,
+    size_t n,
+    const unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  return ipa_verify_explicit_3w_fast_core(
+      ctx, G_vec, H_vec, U, P_in,
+      L1_vec, L2_vec, R1_vec, R2_vec,
+      n,
+      bp_ipa_rounds_3w_et(n),
+      bp_ipa_terminal_len_3w_et(n),
+      a_terminal, b_terminal,
+      ux, ipa_transcript_id);
+}
+
+/* ==========================================================================
  * Dynamically padded 2-way IPA.
  *
  * This is the binary analogue of the dynamic-padding policy used by the 3W

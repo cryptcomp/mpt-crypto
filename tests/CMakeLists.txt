@@ -179,3 +179,18 @@ target_link_libraries(
     mpt-crypto
     secp256k1::secp256k1
 )
+
+add_mpt_test(
+    test_ipa_3w_fast
+    test_ipa_3w_fast.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)
+
+# Optimized 3W verifier comparison benchmark. Build manually; do not register with CTest.
+add_executable(benchmark_ipa_3w_fast benchmark_ipa_3w_fast.c)
+target_link_libraries(
+  benchmark_ipa_3w_fast
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)
