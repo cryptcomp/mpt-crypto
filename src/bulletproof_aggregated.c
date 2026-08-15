@@ -1505,6 +1505,310 @@ cleanup:
   return ok;
 }
 
+/* ==========================================================================
+ * Pure 3-way IPA with early termination.
+ *
+ * Recursion is identical to the baseline pure-3W implementation, except that
+ * it stops as soon as the current vector length is <= 3.  The prover then
+ * reveals the remaining a/b vectors (1, 2, or 3 scalars each) instead of
+ * executing one more 3W round.
+ *
+ * This is intentionally an IPA-only experimental path.  It does not replace
+ * the serialized aggregated Bulletproof format yet.
+ * ========================================================================== */
+
+static inline size_t bp_ipa_rounds_3w_et(size_t n)
+{
+  size_t r = 0;
+  while (n > 3)
+  {
+    n = (n + 2) / 3; /* ceil(n/3) */
+    r++;
+  }
+  return r;
+}
+
+static inline size_t bp_ipa_terminal_len_3w_et(size_t n)
+{
+  while (n > 3)
+    n = (n + 2) / 3;
+  return n;
+}
+
+/*
+ * 3W prover with early termination at current dimension <= 3.
+ *
+ * a_terminal and b_terminal each provide space for exactly 3 scalars.
+ * Unused slots are zeroed.  terminal_n_out is optional and is derivable from n.
+ */
+int secp256k1_bulletproof_run_ipa_prover_3w_et(
+    const secp256k1_context *ctx, const secp256k1_pubkey *U,
+    const secp256k1_pubkey *G_vec, const secp256k1_pubkey *H_vec,
+    const unsigned char *a_vec, const unsigned char *b_vec, size_t n,
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE],
+    const unsigned char ux_scalar[kMPT_SCALAR_SIZE],
+    secp256k1_pubkey *L1_out, secp256k1_pubkey *L2_out,
+    secp256k1_pubkey *R1_out, secp256k1_pubkey *R2_out, size_t max_rounds,
+    size_t *rounds_out,
+    unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    size_t *terminal_n_out)
+{
+  const size_t rounds = bp_ipa_rounds_3w_et(n);
+  const size_t capacity = n + 2;
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  unsigned char *aw = NULL, *bw = NULL;
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  size_t cur_n = n;
+  int ok = 0;
+
+  if (!ctx || !U || !G_vec || !H_vec || !a_vec || !b_vec ||
+      !a_terminal || !b_terminal || n == 0 || rounds > max_rounds)
+    return 0;
+
+  if (rounds > 0 &&
+      (!L1_out || !L2_out || !R1_out || !R2_out))
+    return 0;
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  aw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+  bw = (unsigned char *)malloc(capacity * kMPT_SCALAR_SIZE);
+  if (!Gw || !Hw || !aw || !bw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(Hw, H_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(aw, a_vec, n * kMPT_SCALAR_SIZE);
+  memcpy(bw, b_vec, n * kMPT_SCALAR_SIZE);
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+
+  for (size_t r = 0; r < rounds; r++)
+  {
+    const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+    const size_t pad = padded_n - cur_n;
+    const size_t third_n = padded_n / 3;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (pad)
+    {
+      memset(aw + cur_n * kMPT_SCALAR_SIZE, 0,
+             pad * kMPT_SCALAR_SIZE);
+      memset(bw + cur_n * kMPT_SCALAR_SIZE, 0,
+             pad * kMPT_SCALAR_SIZE);
+
+      if (!derive_ipa_pad_generators_3w(
+              ctx, Gw + cur_n, Hw + cur_n, pad, n, r))
+        goto cleanup;
+    }
+
+    if (!secp256k1_bulletproof_ipa_compute_LR_3w(
+            ctx, &L1_out[r], &L2_out[r], &R1_out[r], &R2_out[r],
+            aw, bw, Gw, Hw, U, ux_scalar, third_n))
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x, last, &L1_out[r], &L2_out[r],
+            &R1_out[r], &R2_out[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!secp256k1_bulletproof_ipa_compress_step_3w(
+            ctx, aw, bw, Gw, Hw, third_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = third_n;
+  }
+
+  if (cur_n == 0 || cur_n > 3)
+    goto cleanup;
+
+  memset(a_terminal, 0, 3 * kMPT_SCALAR_SIZE);
+  memset(b_terminal, 0, 3 * kMPT_SCALAR_SIZE);
+  memcpy(a_terminal, aw, cur_n * kMPT_SCALAR_SIZE);
+  memcpy(b_terminal, bw, cur_n * kMPT_SCALAR_SIZE);
+
+  if (rounds_out)
+    *rounds_out = rounds;
+  if (terminal_n_out)
+    *terminal_n_out = cur_n;
+
+  ok = 1;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+
+  if (aw)
+    OPENSSL_cleanse(aw, capacity * kMPT_SCALAR_SIZE);
+  if (bw)
+    OPENSSL_cleanse(bw, capacity * kMPT_SCALAR_SIZE);
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(secp256k1_pubkey));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(secp256k1_pubkey));
+
+  free(aw);
+  free(bw);
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
+/*
+ * Explicit verifier for the early-termination 3W IPA.
+ *
+ * After applying all transmitted 3W rounds, the verifier has a terminal
+ * statement of dimension t in {1,2,3}:
+ *
+ *   P_t = <a_t,G_t> + <b_t,H_t> + ux*<a_t,b_t>*U.
+ *
+ * It checks that relation directly.
+ */
+int ipa_verify_explicit_3w_et(
+    const secp256k1_context *ctx, const secp256k1_pubkey *G_vec,
+    const secp256k1_pubkey *H_vec, const secp256k1_pubkey *U,
+    const secp256k1_pubkey *P_in, const secp256k1_pubkey *L1_vec,
+    const secp256k1_pubkey *L2_vec, const secp256k1_pubkey *R1_vec,
+    const secp256k1_pubkey *R2_vec, size_t n,
+    const unsigned char a_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char b_terminal[3 * kMPT_SCALAR_SIZE],
+    const unsigned char ux[kMPT_SCALAR_SIZE],
+    const unsigned char ipa_transcript_id[kMPT_SCALAR_SIZE])
+{
+  const size_t rounds = bp_ipa_rounds_3w_et(n);
+  const size_t expected_terminal_n = bp_ipa_terminal_len_3w_et(n);
+  const size_t capacity = n + 2;
+
+  secp256k1_pubkey *Gw = NULL, *Hw = NULL;
+  secp256k1_pubkey P, RHS;
+  unsigned char x[kMPT_SCALAR_SIZE] = {0};
+  unsigned char x_inv[kMPT_SCALAR_SIZE] = {0};
+  unsigned char last[kMPT_SCALAR_SIZE] = {0};
+  unsigned char dot[kMPT_SCALAR_SIZE] = {0};
+  size_t cur_n = n;
+  int RHS_inited = 0;
+  int ok = 0;
+
+  if (!ctx || !G_vec || !H_vec || !U || !P_in ||
+      !a_terminal || !b_terminal || !ux || !ipa_transcript_id || n == 0)
+    return 0;
+
+  if (rounds > 0 &&
+      (!L1_vec || !L2_vec || !R1_vec || !R2_vec))
+    return 0;
+
+  /* Terminal scalars must be canonical.  Unused fixed slots must be zero. */
+  for (size_t i = 0; i < expected_terminal_n; i++)
+  {
+    if (!scalar_is_canonical_3w(
+            a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_canonical_3w(
+            b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+  for (size_t i = expected_terminal_n; i < 3; i++)
+  {
+    if (!scalar_is_zero(a_terminal + i * kMPT_SCALAR_SIZE) ||
+        !scalar_is_zero(b_terminal + i * kMPT_SCALAR_SIZE))
+      return 0;
+  }
+
+  Gw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  Hw = (secp256k1_pubkey *)malloc(capacity * sizeof(secp256k1_pubkey));
+  if (!Gw || !Hw)
+    goto cleanup;
+
+  memcpy(Gw, G_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(Hw, H_vec, n * sizeof(secp256k1_pubkey));
+  memcpy(last, ipa_transcript_id, kMPT_SCALAR_SIZE);
+  P = *P_in;
+
+  for (size_t r = 0; r < rounds; r++)
+  {
+    const size_t padded_n = bp_ipa_padded_len_3w(cur_n);
+    const size_t pad = padded_n - cur_n;
+    const size_t third_n = padded_n / 3;
+
+    if (cur_n <= 3 || padded_n > capacity)
+      goto cleanup;
+
+    if (!derive_ipa_round_challenge_3w(
+            ctx, x, last, &L1_vec[r], &L2_vec[r],
+            &R1_vec[r], &R2_vec[r]))
+      goto cleanup;
+
+    if (!secp256k1_mpt_scalar_inverse(x_inv, x) ||
+        secp256k1_ec_seckey_verify(ctx, x_inv) != 1)
+      goto cleanup;
+
+    if (!apply_ipa_folding_to_P_3w(
+            ctx, &P, &L1_vec[r], &L2_vec[r],
+            &R1_vec[r], &R2_vec[r], x, x_inv))
+      goto cleanup;
+
+    if (pad &&
+        !derive_ipa_pad_generators_3w(
+            ctx, Gw + cur_n, Hw + cur_n, pad, n, r))
+      goto cleanup;
+
+    if (!fold_generators_step_3w(
+            ctx, Gw, Hw, third_n, x, x_inv))
+      goto cleanup;
+
+    memcpy(last, x, kMPT_SCALAR_SIZE);
+    cur_n = third_n;
+  }
+
+  if (cur_n != expected_terminal_n || cur_n == 0 || cur_n > 3)
+    goto cleanup;
+
+  if (!msm_add_checked_3w(
+          ctx, &RHS, &RHS_inited, Gw, a_terminal, cur_n))
+    goto cleanup;
+
+  if (!msm_add_checked_3w(
+          ctx, &RHS, &RHS_inited, Hw, b_terminal, cur_n))
+    goto cleanup;
+
+  if (!secp256k1_bulletproof_ipa_dot(
+          ctx, dot, a_terminal, b_terminal, cur_n))
+    goto cleanup;
+
+  if (!add_scaled_U_term_3w(
+          ctx, &RHS, &RHS_inited, U, dot, ux))
+    goto cleanup;
+
+  if (!RHS_inited)
+    goto cleanup;
+
+  ok = pubkey_equal(ctx, &P, &RHS) ? 1 : 0;
+
+cleanup:
+  OPENSSL_cleanse(x, sizeof(x));
+  OPENSSL_cleanse(x_inv, sizeof(x_inv));
+  OPENSSL_cleanse(last, sizeof(last));
+  OPENSSL_cleanse(dot, sizeof(dot));
+
+  if (Gw)
+    OPENSSL_cleanse(Gw, capacity * sizeof(secp256k1_pubkey));
+  if (Hw)
+    OPENSSL_cleanse(Hw, capacity * sizeof(secp256k1_pubkey));
+
+  free(Gw);
+  free(Hw);
+  return ok;
+}
+
 /**
  * Runs the Inner Product Argument (IPA) prover.
  * Recursively folds vectors G, H, a, and b into a single final term,

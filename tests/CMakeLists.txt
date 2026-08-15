@@ -134,3 +134,18 @@ target_link_libraries(
     mpt-crypto
     secp256k1::secp256k1
 )
+
+add_mpt_test(
+    test_ipa_3w_et
+    test_ipa_3w_et.c
+    DEPENDENCIES mpt-crypto secp256k1::secp256k1
+)
+
+# 3W early-termination microbenchmark. Build manually; do not register with CTest.
+add_executable(benchmark_ipa_3w_et benchmark_ipa_3w_et.c)
+target_link_libraries(
+  benchmark_ipa_3w_et
+  PRIVATE
+    mpt-crypto
+    secp256k1::secp256k1
+)
