@@ -31,8 +31,8 @@ extern "C" {
 
 // Proof sizes in bytes
 #define kMPT_SCHNORR_PROOF_SIZE 64
-#define kMPT_SINGLE_BULLETPROOF_SIZE 688
-#define kMPT_DOUBLE_BULLETPROOF_SIZE 754
+#define kMPT_SINGLE_BULLETPROOF_SIZE 820
+#define kMPT_DOUBLE_BULLETPROOF_SIZE 952
 
 // Context hash size
 #define kMPT_ZKP_CONTEXT_HASH_SIZE 74
