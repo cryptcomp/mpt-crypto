@@ -534,7 +534,7 @@ int main(int argc, char **argv)
     }
 
     static const size_t dims[] = {
-        64, 65, 128, 129, 243, 244, 256, 257
+        33, 64, 65, 69, 72, 81, 128, 129, 130, 243, 244, 256, 257
     };
 
     printf("Hybrid v1 schedule / Pareto benchmark\n");
